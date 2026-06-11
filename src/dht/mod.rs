@@ -1,8 +1,10 @@
-use std::collections::VecDeque;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const NODE_ID_LEN: usize = 32;
 pub const K_BUCKET_COUNT: usize = 256;
+pub const CONTENT_KEY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -100,6 +102,75 @@ impl NodeId {
 
     pub fn bucket_index(&self, other: &Self) -> Option<u8> {
         self.xor_distance(other).bucket_index()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContentKey([u8; CONTENT_KEY_LEN]);
+
+impl ContentKey {
+    pub const fn from_bytes(bytes: [u8; CONTENT_KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_content(content: &[u8]) -> Self {
+        Self(Sha256::digest(content).into())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; CONTENT_KEY_LEN] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderRecord {
+    pub key: ContentKey,
+    pub provider_id: NodeId,
+    pub expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DhtStorage {
+    storage: HashMap<ContentKey, Vec<ProviderRecord>>,
+}
+
+impl DhtStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn upsert_provider(&mut self, record: ProviderRecord, now: Instant) {
+        let providers = self.storage.entry(record.key).or_default();
+        providers.retain(|entry| entry.expires_at > now && entry.provider_id != record.provider_id);
+        providers.push(record);
+    }
+
+    pub fn providers_for(&mut self, key: ContentKey, now: Instant) -> Vec<ProviderRecord> {
+        let Some(providers) = self.storage.get_mut(&key) else {
+            return Vec::new();
+        };
+
+        providers.retain(|entry| entry.expires_at > now);
+        let out = providers.clone();
+        if providers.is_empty() {
+            self.storage.remove(&key);
+        }
+        out
+    }
+
+    pub fn prune_expired(&mut self, now: Instant) -> usize {
+        let mut removed = 0usize;
+        self.storage.retain(|_, providers| {
+            let before = providers.len();
+            providers.retain(|entry| entry.expires_at > now);
+            removed += before.saturating_sub(providers.len());
+            !providers.is_empty()
+        });
+        removed
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.storage.len()
     }
 }
 
@@ -1032,5 +1103,80 @@ mod tests {
         );
         assert_eq!(table.node_status(b), Some(NodeStatus::Active));
         assert_eq!(table.bucket_nodes(255), vec![b]);
+    }
+
+    #[test]
+    fn content_key_from_content_is_stable() {
+        let a = ContentKey::from_content(b"velyx-content");
+        let b = ContentKey::from_content(b"velyx-content");
+        let c = ContentKey::from_content(b"velyx-content-v2");
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn dht_storage_upsert_deduplicates_provider() {
+        let mut storage = DhtStorage::new();
+        let now = Instant::now();
+
+        let key = ContentKey::from_content(b"demo");
+        let provider = NodeId::from_bytes([1u8; NODE_ID_LEN]);
+
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: provider,
+                expires_at: now + Duration::from_secs(10),
+            },
+            now,
+        );
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: provider,
+                expires_at: now + Duration::from_secs(20),
+            },
+            now,
+        );
+
+        let providers = storage.providers_for(key, now);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, provider);
+        assert!(providers[0].expires_at > now + Duration::from_secs(15));
+    }
+
+    #[test]
+    fn dht_storage_prunes_expired_records() {
+        let mut storage = DhtStorage::new();
+        let now = Instant::now();
+
+        let key = ContentKey::from_content(b"ttl-key");
+        let alive = NodeId::from_bytes([2u8; NODE_ID_LEN]);
+        let stale = NodeId::from_bytes([3u8; NODE_ID_LEN]);
+
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: stale,
+                expires_at: now + Duration::from_secs(1),
+            },
+            now,
+        );
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: alive,
+                expires_at: now + Duration::from_secs(10),
+            },
+            now,
+        );
+
+        let removed = storage.prune_expired(now + Duration::from_secs(2));
+        assert_eq!(removed, 1);
+
+        let providers = storage.providers_for(key, now + Duration::from_secs(2));
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, alive);
     }
 }

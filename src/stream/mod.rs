@@ -6,7 +6,8 @@ use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message, dht::NodeId,
+    VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message,
+    dht::{ContentKey, NodeId},
 };
 
 pub const CMD_STREAM_START: u8 = 1;
@@ -15,8 +16,14 @@ pub const CMD_DHT_PING: u8 = 3;
 pub const CMD_DHT_PONG: u8 = 4;
 pub const CMD_DHT_FIND_NODE: u8 = 5;
 pub const CMD_DHT_NODES_FOUND: u8 = 6;
+pub const CMD_DHT_STORE_PROVIDER: u8 = 7;
+pub const CMD_DHT_FIND_VALUE: u8 = 8;
+pub const CMD_DHT_VALUE_FOUND: u8 = 9;
 pub const CMD_DHT_NODE_ID_LEN: usize = 1 + 32;
+pub const CMD_DHT_STORE_PROVIDER_LEN: usize = 1 + 32 + 32;
+pub const CMD_DHT_FIND_VALUE_LEN: usize = 1 + 32;
 pub const DHT_NODE_ID_BYTES: usize = 32;
+pub const DHT_CONTENT_KEY_BYTES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum StreamCommand {
@@ -26,6 +33,15 @@ pub enum StreamCommand {
     Pong { sender_id: NodeId },
     FindNode { target_id: NodeId },
     NodesFound { nodes: Vec<NodeId> },
+    StoreProvider {
+        key: ContentKey,
+        provider_id: NodeId,
+    },
+    FindValue { key: ContentKey },
+    ValueFound {
+        key: ContentKey,
+        providers: Vec<NodeId>,
+    },
 }
 
 fn serialize_nodes(nodes: &[NodeId]) -> Vec<u8> {
@@ -98,6 +114,27 @@ impl StreamCommand {
                 payload.extend_from_slice(&serialize_nodes(nodes));
                 payload
             }
+            Self::StoreProvider { key, provider_id } => {
+                let mut payload = Vec::with_capacity(CMD_DHT_STORE_PROVIDER_LEN);
+                payload.push(CMD_DHT_STORE_PROVIDER);
+                payload.extend_from_slice(key.as_bytes());
+                payload.extend_from_slice(provider_id.as_bytes());
+                payload
+            }
+            Self::FindValue { key } => {
+                let mut payload = Vec::with_capacity(CMD_DHT_FIND_VALUE_LEN);
+                payload.push(CMD_DHT_FIND_VALUE);
+                payload.extend_from_slice(key.as_bytes());
+                payload
+            }
+            Self::ValueFound { key, providers } => {
+                let mut payload =
+                    Vec::with_capacity(1 + DHT_CONTENT_KEY_BYTES + 1 + providers.len() * DHT_NODE_ID_BYTES);
+                payload.push(CMD_DHT_VALUE_FOUND);
+                payload.extend_from_slice(key.as_bytes());
+                payload.extend_from_slice(&serialize_nodes(providers));
+                payload
+            }
         }
     }
 
@@ -156,6 +193,53 @@ impl StreamCommand {
             CMD_DHT_NODES_FOUND => {
                 let nodes = deserialize_nodes(&payload[1..])?;
                 Ok(Self::NodesFound { nodes })
+            }
+            CMD_DHT_STORE_PROVIDER => {
+                if payload.len() != CMD_DHT_STORE_PROVIDER_LEN {
+                    bail!(
+                        "invalid DHT_STORE_PROVIDER payload length: {}",
+                        payload.len()
+                    );
+                }
+
+                let mut key = [0u8; DHT_CONTENT_KEY_BYTES];
+                key.copy_from_slice(&payload[1..1 + DHT_CONTENT_KEY_BYTES]);
+
+                let mut provider_id = [0u8; DHT_NODE_ID_BYTES];
+                provider_id.copy_from_slice(
+                    &payload[1 + DHT_CONTENT_KEY_BYTES..1 + DHT_CONTENT_KEY_BYTES + DHT_NODE_ID_BYTES],
+                );
+
+                Ok(Self::StoreProvider {
+                    key: ContentKey::from_bytes(key),
+                    provider_id: NodeId::from_bytes(provider_id),
+                })
+            }
+            CMD_DHT_FIND_VALUE => {
+                if payload.len() != CMD_DHT_FIND_VALUE_LEN {
+                    bail!("invalid DHT_FIND_VALUE payload length: {}", payload.len());
+                }
+
+                let mut key = [0u8; DHT_CONTENT_KEY_BYTES];
+                key.copy_from_slice(&payload[1..1 + DHT_CONTENT_KEY_BYTES]);
+
+                Ok(Self::FindValue {
+                    key: ContentKey::from_bytes(key),
+                })
+            }
+            CMD_DHT_VALUE_FOUND => {
+                if payload.len() < 2 + DHT_CONTENT_KEY_BYTES {
+                    bail!("invalid DHT_VALUE_FOUND payload length: {}", payload.len());
+                }
+
+                let mut key = [0u8; DHT_CONTENT_KEY_BYTES];
+                key.copy_from_slice(&payload[1..1 + DHT_CONTENT_KEY_BYTES]);
+                let providers = deserialize_nodes(&payload[1 + DHT_CONTENT_KEY_BYTES..])?;
+
+                Ok(Self::ValueFound {
+                    key: ContentKey::from_bytes(key),
+                    providers,
+                })
             }
             other => bail!("unknown stream command: {other}"),
         }
@@ -251,7 +335,10 @@ impl StreamReceiver {
             StreamCommand::Ping { .. }
             | StreamCommand::Pong { .. }
             | StreamCommand::FindNode { .. }
-            | StreamCommand::NodesFound { .. } => Ok(StreamControlEvent::Ignored),
+            | StreamCommand::NodesFound { .. }
+            | StreamCommand::StoreProvider { .. }
+            | StreamCommand::FindValue { .. }
+            | StreamCommand::ValueFound { .. } => Ok(StreamControlEvent::Ignored),
         }
     }
 
@@ -648,6 +735,33 @@ mod tests {
             .on_control_payload(&nodes)
             .expect("nodes_found should decode");
         assert_eq!(event, StreamControlEvent::Ignored);
+
+        let key = ContentKey::from_bytes([0x33; 32]);
+        let store = StreamCommand::StoreProvider {
+            key,
+            provider_id: sender,
+        }
+        .encode();
+        let event = receiver
+            .on_control_payload(&store)
+            .expect("store_provider should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
+
+        let find_value = StreamCommand::FindValue { key }.encode();
+        let event = receiver
+            .on_control_payload(&find_value)
+            .expect("find_value should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
+
+        let value_found = StreamCommand::ValueFound {
+            key,
+            providers: vec![sender],
+        }
+        .encode();
+        let event = receiver
+            .on_control_payload(&value_found)
+            .expect("value_found should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
     }
 
     #[test]
@@ -676,8 +790,72 @@ mod tests {
     }
 
     #[test]
+    fn store_provider_and_find_value_roundtrip() {
+        let key = ContentKey::from_bytes([0xAB; 32]);
+        let provider = NodeId::from_bytes([0x42; 32]);
+
+        let store = StreamCommand::StoreProvider {
+            key,
+            provider_id: provider,
+        };
+        let store_raw = store.encode();
+        match StreamCommand::decode(&store_raw).expect("decode store_provider") {
+            StreamCommand::StoreProvider {
+                key: decoded_key,
+                provider_id,
+            } => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(provider_id, provider);
+            }
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+
+        let find = StreamCommand::FindValue { key };
+        let find_raw = find.encode();
+        match StreamCommand::decode(&find_raw).expect("decode find_value") {
+            StreamCommand::FindValue { key: decoded_key } => assert_eq!(decoded_key, key),
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_found_roundtrip() {
+        let key = ContentKey::from_bytes([0x11; 32]);
+        let p1 = NodeId::from_bytes([0xA1; 32]);
+        let p2 = NodeId::from_bytes([0xB2; 32]);
+
+        let value = StreamCommand::ValueFound {
+            key,
+            providers: vec![p1, p2],
+        };
+        let raw = value.encode();
+        match StreamCommand::decode(&raw).expect("decode value_found") {
+            StreamCommand::ValueFound {
+                key: decoded_key,
+                providers,
+            } => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(providers, vec![p1, p2]);
+            }
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn nodes_found_rejects_invalid_length() {
         let malformed = vec![CMD_DHT_NODES_FOUND, 2, 0xAA];
+        assert!(StreamCommand::decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn store_provider_rejects_invalid_length() {
+        let malformed = vec![CMD_DHT_STORE_PROVIDER, 1, 2, 3];
+        assert!(StreamCommand::decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn value_found_rejects_invalid_length() {
+        let malformed = vec![CMD_DHT_VALUE_FOUND, 0xAA];
         assert!(StreamCommand::decode(&malformed).is_err());
     }
 }

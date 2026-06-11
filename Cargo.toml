@@ -12,6 +12,7 @@ rand_core = { version = "0.6", features = ["std"] }
 raptorq = "1.8"
 snow = "0.9"
 tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

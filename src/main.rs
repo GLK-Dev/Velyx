@@ -14,7 +14,7 @@ use velyx::{
     ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
     ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
     chunk_control_message, negotiate, parse_server_and_validate,
-    dht::{DhtMetricsSnapshot, NodeId, RoutingTable},
+    dht::{DhtMetricsSnapshot, DhtStorage, NodeId, ProviderRecord, RoutingTable},
 };
 use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
@@ -29,6 +29,7 @@ const DHT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(20);
 const DHT_REFRESH_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DHT_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_PING_TIMEOUT: Duration = Duration::from_secs(6);
+const DHT_PROVIDER_RECORD_TTL: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SessionState {
@@ -373,6 +374,7 @@ async fn run_responder(
     let local = local_caps();
     let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
     let mut dht = RoutingTable::new(local_node_id, 20);
+    let mut dht_storage = DhtStorage::new();
     let mut dht_routes: HashMap<NodeId, SocketAddr> = HashMap::new();
     let mut pending_dht_actions = Vec::new();
     let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
@@ -740,6 +742,109 @@ async fn run_responder(
                                 {
                                     println!("[{remote}] Failed to send DHT NODES_FOUND: {err}");
                                 }
+                            }
+                            Ok(StreamCommand::StoreProvider { key, provider_id }) => {
+                                dht_routes.insert(provider_id, remote);
+
+                                let now = std::time::Instant::now();
+                                dht_storage.upsert_provider(
+                                    ProviderRecord {
+                                        key,
+                                        provider_id,
+                                        expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                                    },
+                                    now,
+                                );
+
+                                let insert_result = dht.insert_with_actions(provider_id);
+                                pending_dht_actions.extend(insert_result.actions);
+
+                                println!(
+                                    "[{remote}] Received DHT STORE_PROVIDER key={} provider={} (keys={})",
+                                    hex::encode(key.as_bytes()),
+                                    hex::encode(provider_id.as_bytes()),
+                                    dht_storage.key_count()
+                                );
+                            }
+                            Ok(StreamCommand::FindValue { key }) => {
+                                let now = std::time::Instant::now();
+                                let providers = dht_storage.providers_for(key, now);
+                                let message_id = session.next_dht_message_id;
+                                session.next_dht_message_id =
+                                    session.next_dht_message_id.wrapping_add(1);
+
+                                if providers.is_empty() {
+                                    let target_id = NodeId::from_bytes(*key.as_bytes());
+                                    let closest = dht.lookup_with_metrics(target_id);
+                                    if let Err(err) = send_control_command(
+                                        &socket,
+                                        transport,
+                                        &mut out_buf,
+                                        session.session_id,
+                                        &mut session.tx_seq,
+                                        &mut session.vwp_tx_seq,
+                                        session.last_stream_id,
+                                        message_id,
+                                        remote,
+                                        StreamCommand::NodesFound { nodes: closest },
+                                    )
+                                    .await
+                                    {
+                                        println!(
+                                            "[{remote}] Failed to send DHT NODES_FOUND for FIND_VALUE: {err}"
+                                        );
+                                    }
+                                } else {
+                                    let provider_ids = providers
+                                        .into_iter()
+                                        .map(|record| record.provider_id)
+                                        .collect::<Vec<_>>();
+
+                                    if let Err(err) = send_control_command(
+                                        &socket,
+                                        transport,
+                                        &mut out_buf,
+                                        session.session_id,
+                                        &mut session.tx_seq,
+                                        &mut session.vwp_tx_seq,
+                                        session.last_stream_id,
+                                        message_id,
+                                        remote,
+                                        StreamCommand::ValueFound {
+                                            key,
+                                            providers: provider_ids,
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        println!(
+                                            "[{remote}] Failed to send DHT VALUE_FOUND for FIND_VALUE: {err}"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(StreamCommand::ValueFound { key, providers }) => {
+                                let now = std::time::Instant::now();
+                                for provider_id in providers.iter().copied() {
+                                    dht_routes.insert(provider_id, remote);
+                                    dht_storage.upsert_provider(
+                                        ProviderRecord {
+                                            key,
+                                            provider_id,
+                                            expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                                        },
+                                        now,
+                                    );
+                                    let insert_result = dht.insert_with_actions(provider_id);
+                                    pending_dht_actions.extend(insert_result.actions);
+                                }
+
+                                println!(
+                                    "[{remote}] Received DHT VALUE_FOUND key={} providers={} (keys={})",
+                                    hex::encode(key.as_bytes()),
+                                    providers.len(),
+                                    dht_storage.key_count()
+                                );
                             }
                             Ok(StreamCommand::NodesFound { nodes }) => {
                                 println!(
@@ -1363,6 +1468,7 @@ async fn run_initiator(
     let mut stop_received = false;
     let mut local_control_assembler = ControlAssembler::default();
     let mut dht = RoutingTable::new(local_node_id, 20);
+    let mut dht_storage = DhtStorage::new();
     let mut dht_routes: HashMap<NodeId, ([u8; VWP_STREAM_ID_LEN], SocketAddr)> = HashMap::new();
     let mut pending_pings: HashMap<NodeId, std::time::Instant> = HashMap::new();
     let mut next_dht_message_id = 100u32;
@@ -1743,6 +1849,179 @@ async fn run_initiator(
                             )
                             .await
                             .context("send DHT NODES_FOUND")?;
+                        }
+                        Ok(StreamCommand::StoreProvider { key, provider_id }) => {
+                            let now = std::time::Instant::now();
+                            dht_routes.insert(provider_id, (control_stream_id, remote));
+                            dht_storage.upsert_provider(
+                                ProviderRecord {
+                                    key,
+                                    provider_id,
+                                    expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                                },
+                                now,
+                            );
+                            let insert_result = dht.insert_with_actions(provider_id);
+                            for action in insert_result.actions {
+                                let Some(executed) = execute_dht_action(action, local_node_id)
+                                else {
+                                    continue;
+                                };
+                                let route_to = executed.route_to;
+                                let command = executed.command;
+                                let is_ping = matches!(command, StreamCommand::Ping { .. });
+                                let (target_stream_id, target_addr) =
+                                    if let Some(route_to) = executed.route_to {
+                                        let Some(route) = dht_routes.get(&route_to).copied() else {
+                                            println!(
+                                                "Skipping DHT action: no known route for target_id={}",
+                                                hex::encode(route_to.as_bytes())
+                                            );
+                                            continue;
+                                        };
+                                        route
+                                    } else {
+                                        (control_stream_id, remote)
+                                    };
+
+                                let message_id = next_dht_message_id;
+                                next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    target_stream_id,
+                                    message_id,
+                                    target_addr,
+                                    command,
+                                )
+                                .await
+                                .context("execute DHT action from store_provider result")?;
+                                if let Some(target_node) = route_to.filter(|_| is_ping) {
+                                    pending_pings.insert(target_node, std::time::Instant::now());
+                                }
+                            }
+
+                            println!(
+                                "Received DHT STORE_PROVIDER from responder (key={} provider={})",
+                                hex::encode(key.as_bytes()),
+                                hex::encode(provider_id.as_bytes())
+                            );
+                        }
+                        Ok(StreamCommand::FindValue { key }) => {
+                            let now = std::time::Instant::now();
+                            let providers = dht_storage.providers_for(key, now);
+                            let message_id = next_dht_message_id;
+                            next_dht_message_id = next_dht_message_id.wrapping_add(1);
+
+                            if providers.is_empty() {
+                                let target_id = NodeId::from_bytes(*key.as_bytes());
+                                let closest = dht.lookup_with_metrics(target_id);
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    control_stream_id,
+                                    message_id,
+                                    remote,
+                                    StreamCommand::NodesFound { nodes: closest },
+                                )
+                                .await
+                                .context("send DHT NODES_FOUND for FIND_VALUE")?;
+                            } else {
+                                let provider_ids = providers
+                                    .into_iter()
+                                    .map(|record| record.provider_id)
+                                    .collect::<Vec<_>>();
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    control_stream_id,
+                                    message_id,
+                                    remote,
+                                    StreamCommand::ValueFound {
+                                        key,
+                                        providers: provider_ids,
+                                    },
+                                )
+                                .await
+                                .context("send DHT VALUE_FOUND for FIND_VALUE")?;
+                            }
+                        }
+                        Ok(StreamCommand::ValueFound { key, providers }) => {
+                            let now = std::time::Instant::now();
+                            for provider_id in providers.iter().copied() {
+                                dht_routes.insert(provider_id, (control_stream_id, remote));
+                                dht_storage.upsert_provider(
+                                    ProviderRecord {
+                                        key,
+                                        provider_id,
+                                        expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                                    },
+                                    now,
+                                );
+                                let insert_result = dht.insert_with_actions(provider_id);
+                                for action in insert_result.actions {
+                                    let Some(executed) = execute_dht_action(action, local_node_id)
+                                    else {
+                                        continue;
+                                    };
+                                    let route_to = executed.route_to;
+                                    let command = executed.command;
+                                    let is_ping = matches!(command, StreamCommand::Ping { .. });
+                                    let (target_stream_id, target_addr) =
+                                        if let Some(route_to) = executed.route_to {
+                                            let Some(route) = dht_routes.get(&route_to).copied()
+                                            else {
+                                                println!(
+                                                    "Skipping DHT action: no known route for target_id={}",
+                                                    hex::encode(route_to.as_bytes())
+                                                );
+                                                continue;
+                                            };
+                                            route
+                                        } else {
+                                            (control_stream_id, remote)
+                                        };
+
+                                    let message_id = next_dht_message_id;
+                                    next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                    send_control_command(
+                                        &socket,
+                                        &mut transport,
+                                        &mut out_buf,
+                                        session_id,
+                                        &mut tx_seq,
+                                        &mut vwp_data_seq,
+                                        target_stream_id,
+                                        message_id,
+                                        target_addr,
+                                        command,
+                                    )
+                                    .await
+                                    .context("execute DHT action from value_found result")?;
+                                    if let Some(target_node) = route_to.filter(|_| is_ping) {
+                                        pending_pings
+                                            .insert(target_node, std::time::Instant::now());
+                                    }
+                                }
+                            }
+
+                            println!(
+                                "Received DHT VALUE_FOUND from responder (key={} providers={})",
+                                hex::encode(key.as_bytes()),
+                                providers.len()
+                            );
                         }
                         Ok(StreamCommand::NodesFound { nodes }) => {
                             println!(

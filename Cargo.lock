@@ -652,6 +652,7 @@ dependencies = [
  "raptorq",
  "serde",
  "serde_json",
+ "sha2",
  "snow",
  "tokio",
 ]
