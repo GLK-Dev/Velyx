@@ -1,0 +1,49 @@
+name: Scheduled Benchmarks
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run Matrix and Generate Charts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install matplotlib
+
+      - name: Run benchmark matrix
+        run: cargo run --release -- benchmark whitepaper_benchmarks.csv --payload-bytes 262144
+
+      - name: Generate charts
+        run: python scripts/plot_benchmarks.py --input whitepaper_benchmarks.csv --outdir charts
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velyx-benchmark-results
+          path: |
+            whitepaper_benchmarks.csv
+            charts/
+          retention-days: 30

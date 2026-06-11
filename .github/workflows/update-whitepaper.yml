@@ -1,0 +1,53 @@
+name: Update Whitepaper Metrics
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  update_docs:
+    name: Regenerate and Commit Whitepaper
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install matplotlib
+
+      - name: Run benchmark matrix
+        run: cargo run --release -- benchmark whitepaper_benchmarks.csv --payload-bytes 262144
+
+      - name: Generate charts
+        run: python scripts/plot_benchmarks.py --input whitepaper_benchmarks.csv --outdir charts
+
+      - name: Inject metrics into whitepaper
+        run: python scripts/inject_whitepaper_metrics.py --csv whitepaper_benchmarks.csv --whitepaper WHITEPAPER.md --payload-bytes 262144
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: auto-update whitepaper metrics and charts"
+          file_pattern: "WHITEPAPER.md charts/* whitepaper_benchmarks.csv"
+          commit_user_name: "Velyx Bot"
+          commit_user_email: "actions@github.com"
