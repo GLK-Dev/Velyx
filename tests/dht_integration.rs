@@ -1,4 +1,8 @@
-use velyx::dht::{InsertOutcome, NodeId, RoutingAction, RoutingTable};
+use std::time::{Duration, Instant};
+
+use velyx::dht::{
+    ContentKey, DhtStorage, InsertOutcome, NodeId, ProviderRecord, RoutingAction, RoutingTable,
+};
 use velyx::dht_bridge::execute_dht_action;
 use velyx::stream::StreamCommand;
 
@@ -72,4 +76,56 @@ fn dht_action_to_ping_pong_roundtrip_updates_both_tables() {
 
     assert!(table_contains(&table_a, id_b));
     assert!(table_contains(&table_b, id_a));
+}
+
+#[test]
+fn republish_store_provider_roundtrip_makes_remote_find_value_hit() {
+    let local_provider = NodeId::from_bytes([0x11; 32]);
+    let remote_node = NodeId::from_bytes([0x22; 32]);
+    let key = ContentKey::from_content(b"velyx-republish-demo");
+    let now = Instant::now();
+
+    let mut local_storage = DhtStorage::new();
+    local_storage.upsert_provider(
+        ProviderRecord {
+            key,
+            provider_id: local_provider,
+            expires_at: now + Duration::from_secs(10),
+        },
+        now,
+    );
+
+    let expiring = local_storage.get_expiring_records(now, Duration::from_secs(15));
+    assert_eq!(expiring.len(), 1);
+    assert_eq!(expiring[0].provider_id, local_provider);
+
+    let outbound = StreamCommand::StoreProvider {
+        key,
+        provider_id: local_provider,
+    }
+    .encode();
+    let decoded = StreamCommand::decode(&outbound).expect("decode store_provider");
+
+    let mut remote_storage = DhtStorage::new();
+    let mut remote_table = RoutingTable::new(remote_node, 20);
+    match decoded {
+        StreamCommand::StoreProvider { key, provider_id } => {
+            remote_storage.upsert_provider(
+                ProviderRecord {
+                    key,
+                    provider_id,
+                    expires_at: now + Duration::from_secs(20),
+                },
+                now,
+            );
+            let result = remote_table.insert_with_actions(provider_id);
+            assert!(matches!(result.value, InsertOutcome::Inserted { .. }));
+        }
+        other => panic!("expected store provider command, got {other:?}"),
+    }
+
+    let providers = remote_storage.providers_for(key, now + Duration::from_secs(1));
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].provider_id, local_provider);
+    assert!(table_contains(&remote_table, local_provider));
 }

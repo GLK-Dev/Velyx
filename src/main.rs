@@ -30,6 +30,8 @@ const DHT_REFRESH_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DHT_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_PING_TIMEOUT: Duration = Duration::from_secs(6);
 const DHT_PROVIDER_RECORD_TTL: Duration = Duration::from_secs(20 * 60);
+const DHT_REPUBLISH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const DHT_PROVIDER_REPUBLISH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SessionState {
@@ -332,7 +334,7 @@ fn log_dht_metrics(role: &str, snapshot: DhtMetricsSnapshot) {
     let bucket_fill_ratio = snapshot.bucket_fill_ratio(20);
     let m = snapshot.metrics;
     println!(
-        "[DHT][metrics][{role}] nodes={} non_empty_buckets={} max_bucket_len={} bucket_fill_ratio={:.3} ping_success_rate={:.3} avg_nodes_per_batch={:.2} inserted={} existing={} pending={} ignored={} mark_ok={} mark_miss={} replace_ok={} replace_miss={} suspected={} evicted={} lookup_queries={} nodes_found_batches={} nodes_found_nodes={} refresh_marked={} actions_ping={} actions_lookup={}",
+        "[DHT][metrics][{role}] nodes={} non_empty_buckets={} max_bucket_len={} bucket_fill_ratio={:.3} ping_success_rate={:.3} avg_nodes_per_batch={:.2} inserted={} existing={} pending={} ignored={} mark_ok={} mark_miss={} replace_ok={} replace_miss={} suspected={} evicted={} value_hit={} value_miss={} store_provider_received={} lookup_queries={} nodes_found_batches={} nodes_found_nodes={} refresh_marked={} actions_ping={} actions_lookup={}",
         snapshot.total_nodes,
         snapshot.non_empty_buckets,
         snapshot.max_bucket_len,
@@ -349,6 +351,9 @@ fn log_dht_metrics(role: &str, snapshot: DhtMetricsSnapshot) {
         m.replace_stale_miss,
         m.nodes_suspected,
         m.nodes_evicted,
+        m.value_lookup_hit,
+        m.value_lookup_miss,
+        m.store_provider_received,
         m.lookup_queries,
         m.nodes_found_batches,
         m.nodes_found_nodes_total,
@@ -378,6 +383,7 @@ async fn run_responder(
     let mut dht_routes: HashMap<NodeId, SocketAddr> = HashMap::new();
     let mut pending_dht_actions = Vec::new();
     let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
+    let mut next_republish_check = std::time::Instant::now() + DHT_REPUBLISH_CHECK_INTERVAL;
     let mut next_metrics_log = std::time::Instant::now() + DHT_METRICS_LOG_INTERVAL;
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
@@ -745,6 +751,7 @@ async fn run_responder(
                             }
                             Ok(StreamCommand::StoreProvider { key, provider_id }) => {
                                 dht_routes.insert(provider_id, remote);
+                                dht.record_store_provider_received();
 
                                 let now = std::time::Instant::now();
                                 dht_storage.upsert_provider(
@@ -774,6 +781,7 @@ async fn run_responder(
                                     session.next_dht_message_id.wrapping_add(1);
 
                                 if providers.is_empty() {
+                                    dht.record_value_lookup_miss();
                                     let target_id = NodeId::from_bytes(*key.as_bytes());
                                     let closest = dht.lookup_with_metrics(target_id);
                                     if let Err(err) = send_control_command(
@@ -795,6 +803,7 @@ async fn run_responder(
                                         );
                                     }
                                 } else {
+                                    dht.record_value_lookup_hit();
                                     let provider_ids = providers
                                         .into_iter()
                                         .map(|record| record.provider_id)
@@ -1147,6 +1156,76 @@ async fn run_responder(
             next_refresh_check = now + DHT_REFRESH_CHECK_INTERVAL;
         }
 
+        if now >= next_republish_check {
+            dht_storage.prune_expired(now);
+            let expiring_records = dht_storage
+                .get_expiring_records(now, DHT_PROVIDER_REPUBLISH_WINDOW)
+                .into_iter()
+                .filter(|record| record.provider_id == local_node_id)
+                .collect::<Vec<_>>();
+
+            for record in expiring_records {
+                let eligible_peers = peers
+                    .iter()
+                    .filter_map(|(peer_addr, session)| {
+                        (session.state == SessionState::Active
+                            && session.transport.is_some()
+                            && session.last_stream_id != [0u8; VWP_STREAM_ID_LEN])
+                            .then_some(*peer_addr)
+                    })
+                    .collect::<Vec<_>>();
+                if eligible_peers.is_empty() {
+                    continue;
+                }
+
+                dht_storage.upsert_provider(
+                    ProviderRecord {
+                        key: record.key,
+                        provider_id: record.provider_id,
+                        expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                    },
+                    now,
+                );
+
+                for peer_addr in eligible_peers {
+                    let Some(session) = peers.get_mut(&peer_addr) else {
+                        continue;
+                    };
+                    let Some(transport) = session.transport.as_mut() else {
+                        continue;
+                    };
+
+                    let message_id = session.next_dht_message_id;
+                    session.next_dht_message_id = session.next_dht_message_id.wrapping_add(1);
+                    if let Err(err) = send_control_command(
+                        &socket,
+                        transport,
+                        &mut out_buf,
+                        session.session_id,
+                        &mut session.tx_seq,
+                        &mut session.vwp_tx_seq,
+                        session.last_stream_id,
+                        message_id,
+                        peer_addr,
+                        StreamCommand::StoreProvider {
+                            key: record.key,
+                            provider_id: record.provider_id,
+                        },
+                    )
+                    .await
+                    {
+                        println!(
+                            "[DHT] Republish STORE_PROVIDER failed for {} via {}: {err}",
+                            hex::encode(record.key.as_bytes()),
+                            peer_addr,
+                        );
+                    }
+                }
+            }
+
+            next_republish_check = now + DHT_REPUBLISH_CHECK_INTERVAL;
+        }
+
         if now >= next_metrics_log {
             log_dht_metrics("responder", dht.metrics_snapshot());
             next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
@@ -1474,6 +1553,7 @@ async fn run_initiator(
     let mut next_dht_message_id = 100u32;
     let mut next_discovery_at = std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY;
     let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
+    let mut next_republish_check = std::time::Instant::now() + DHT_REPUBLISH_CHECK_INTERVAL;
     let mut next_metrics_log = std::time::Instant::now() + DHT_METRICS_LOG_INTERVAL;
     let mut sent_frames = 0usize;
     let mut logged_waiting_for_stop = false;
@@ -1853,6 +1933,7 @@ async fn run_initiator(
                         Ok(StreamCommand::StoreProvider { key, provider_id }) => {
                             let now = std::time::Instant::now();
                             dht_routes.insert(provider_id, (control_stream_id, remote));
+                            dht.record_store_provider_received();
                             dht_storage.upsert_provider(
                                 ProviderRecord {
                                     key,
@@ -1918,6 +1999,7 @@ async fn run_initiator(
                             next_dht_message_id = next_dht_message_id.wrapping_add(1);
 
                             if providers.is_empty() {
+                                dht.record_value_lookup_miss();
                                 let target_id = NodeId::from_bytes(*key.as_bytes());
                                 let closest = dht.lookup_with_metrics(target_id);
                                 send_control_command(
@@ -1935,6 +2017,7 @@ async fn run_initiator(
                                 .await
                                 .context("send DHT NODES_FOUND for FIND_VALUE")?;
                             } else {
+                                dht.record_value_lookup_hit();
                                 let provider_ids = providers
                                     .into_iter()
                                     .map(|record| record.provider_id)
@@ -1972,6 +2055,48 @@ async fn run_initiator(
                                 );
                                 let insert_result = dht.insert_with_actions(provider_id);
                                 for action in insert_result.actions {
+
+                            if now >= next_republish_check {
+                                dht_storage.prune_expired(now);
+                                let expiring_records = dht_storage
+                                    .get_expiring_records(now, DHT_PROVIDER_REPUBLISH_WINDOW)
+                                    .into_iter()
+                                    .filter(|record| record.provider_id == local_node_id)
+                                    .collect::<Vec<_>>();
+
+                                for record in expiring_records {
+                                    dht_storage.upsert_provider(
+                                        ProviderRecord {
+                                            key: record.key,
+                                            provider_id: record.provider_id,
+                                            expires_at: now + DHT_PROVIDER_RECORD_TTL,
+                                        },
+                                        now,
+                                    );
+
+                                    let message_id = next_dht_message_id;
+                                    next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                    send_control_command(
+                                        &socket,
+                                        &mut transport,
+                                        &mut out_buf,
+                                        session_id,
+                                        &mut tx_seq,
+                                        &mut vwp_data_seq,
+                                        stream_id,
+                                        message_id,
+                                        remote,
+                                        StreamCommand::StoreProvider {
+                                            key: record.key,
+                                            provider_id: record.provider_id,
+                                        },
+                                    )
+                                    .await
+                                    .context("send DHT STORE_PROVIDER republish")?;
+                                }
+
+                                next_republish_check = now + DHT_REPUBLISH_CHECK_INTERVAL;
+                            }
                                     let Some(executed) = execute_dht_action(action, local_node_id)
                                     else {
                                         continue;

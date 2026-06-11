@@ -37,6 +37,9 @@ pub struct DhtMetrics {
     pub actions_generated_lookup: u64,
     pub nodes_suspected: u64,
     pub nodes_evicted: u64,
+    pub value_lookup_hit: u64,
+    pub value_lookup_miss: u64,
+    pub store_provider_received: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,24 @@ impl DhtStorage {
             !providers.is_empty()
         });
         removed
+    }
+
+    pub fn get_expiring_records(&mut self, now: Instant, window: Duration) -> Vec<ProviderRecord> {
+        let cutoff = now + window;
+        let mut expiring = Vec::new();
+
+        self.storage.retain(|_, providers| {
+            providers.retain(|entry| entry.expires_at > now);
+            expiring.extend(
+                providers
+                    .iter()
+                    .copied()
+                    .filter(|entry| entry.expires_at <= cutoff),
+            );
+            !providers.is_empty()
+        });
+
+        expiring
     }
 
     pub fn key_count(&self) -> usize {
@@ -674,6 +695,18 @@ impl RoutingTable {
         }
     }
 
+    pub fn record_value_lookup_hit(&mut self) {
+        self.metrics.value_lookup_hit += 1;
+    }
+
+    pub fn record_value_lookup_miss(&mut self) {
+        self.metrics.value_lookup_miss += 1;
+    }
+
+    pub fn record_store_provider_received(&mut self) {
+        self.metrics.store_provider_received += 1;
+    }
+
     pub fn metrics_snapshot(&self) -> DhtMetricsSnapshot {
         let mut total_nodes = 0usize;
         let mut non_empty_buckets = 0usize;
@@ -1178,5 +1211,45 @@ mod tests {
         let providers = storage.providers_for(key, now + Duration::from_secs(2));
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].provider_id, alive);
+    }
+
+    #[test]
+    fn dht_storage_returns_records_expiring_within_window() {
+        let mut storage = DhtStorage::new();
+        let now = Instant::now();
+
+        let key = ContentKey::from_content(b"republish-key");
+        let soon = NodeId::from_bytes([4u8; NODE_ID_LEN]);
+        let later = NodeId::from_bytes([5u8; NODE_ID_LEN]);
+        let expired = NodeId::from_bytes([6u8; NODE_ID_LEN]);
+
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: soon,
+                expires_at: now + Duration::from_secs(5),
+            },
+            now,
+        );
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: later,
+                expires_at: now + Duration::from_secs(50),
+            },
+            now,
+        );
+        storage.upsert_provider(
+            ProviderRecord {
+                key,
+                provider_id: expired,
+                expires_at: now + Duration::from_secs(1),
+            },
+            now - Duration::from_secs(2),
+        );
+
+        let expiring = storage.get_expiring_records(now + Duration::from_secs(2), Duration::from_secs(10));
+        assert_eq!(expiring.len(), 1);
+        assert_eq!(expiring[0].provider_id, soon);
     }
 }
