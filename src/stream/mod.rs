@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use raptorq::{Decoder as RaptorDecoder, Encoder as RaptorEncoder, EncodingPacket, ObjectTransmissionInformation};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message};
 
@@ -205,6 +208,144 @@ impl ChaosConfig {
 pub struct DirtyNetwork {
     config: ChaosConfig,
     state: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamMetrics {
+    pub finished_at_unix_ms: u128,
+    pub peer: String,
+    pub session_id: u64,
+    pub transfer_length: u64,
+    pub symbol_size: u16,
+    pub min_symbols_required: u64,
+    pub data_frames_ingested: u64,
+    pub data_frames_dropped: u64,
+    pub data_frames_duplicated: u64,
+    pub data_frames_reordered: u64,
+    pub control_acks_sent: u64,
+    pub recovery_time_ms: u128,
+    pub goodput_bytes_per_sec: f64,
+    pub overhead_ratio: f64,
+}
+
+#[derive(Debug, Default)]
+pub struct StreamTelemetry {
+    start_at: Option<Instant>,
+    transfer_length: u64,
+    symbol_size: u16,
+    min_symbols_required: u64,
+    data_frames_ingested: u64,
+    data_frames_dropped: u64,
+    data_frames_duplicated: u64,
+    data_frames_reordered: u64,
+    control_acks_sent: u64,
+}
+
+impl StreamTelemetry {
+    pub fn on_stream_start(&mut self, config: ObjectTransmissionInformation) {
+        self.start_at = Some(Instant::now());
+        self.transfer_length = config.transfer_length();
+        self.symbol_size = config.symbol_size();
+        self.min_symbols_required = self.transfer_length.div_ceil(self.symbol_size as u64);
+        self.data_frames_ingested = 0;
+        self.data_frames_dropped = 0;
+        self.data_frames_duplicated = 0;
+        self.data_frames_reordered = 0;
+        self.control_acks_sent = 0;
+    }
+
+    pub fn on_data_ingested(&mut self) {
+        self.data_frames_ingested += 1;
+    }
+
+    pub fn on_data_drop(&mut self) {
+        self.data_frames_dropped += 1;
+    }
+
+    pub fn on_data_duplicated(&mut self, count: u64) {
+        self.data_frames_duplicated += count;
+    }
+
+    pub fn on_data_reordered(&mut self) {
+        self.data_frames_reordered += 1;
+    }
+
+    pub fn on_control_ack_sent(&mut self) {
+        self.control_acks_sent += 1;
+    }
+
+    pub fn finalize(&self, peer: String, session_id: u64, decoded_bytes: usize) -> Option<StreamMetrics> {
+        let started = self.start_at?;
+        let recovery_time_ms = started.elapsed().as_millis();
+        let seconds = (recovery_time_ms as f64 / 1000.0).max(0.001);
+        let goodput_bytes_per_sec = decoded_bytes as f64 / seconds;
+        let overhead_ratio = if self.min_symbols_required == 0 {
+            0.0
+        } else {
+            self.data_frames_ingested as f64 / self.min_symbols_required as f64
+        };
+
+        let finished_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        Some(StreamMetrics {
+            finished_at_unix_ms,
+            peer,
+            session_id,
+            transfer_length: self.transfer_length,
+            symbol_size: self.symbol_size,
+            min_symbols_required: self.min_symbols_required,
+            data_frames_ingested: self.data_frames_ingested,
+            data_frames_dropped: self.data_frames_dropped,
+            data_frames_duplicated: self.data_frames_duplicated,
+            data_frames_reordered: self.data_frames_reordered,
+            control_acks_sent: self.control_acks_sent,
+            recovery_time_ms,
+            goodput_bytes_per_sec,
+            overhead_ratio,
+        })
+    }
+}
+
+pub fn append_metrics_csv(path: &str, metrics: &StreamMetrics) -> Result<()> {
+    let file_exists = std::path::Path::new(path).exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open metrics CSV path: {path}"))?;
+
+    if !file_exists {
+        writeln!(
+            file,
+            "finished_at_unix_ms,peer,session_id,transfer_length,symbol_size,min_symbols_required,data_frames_ingested,data_frames_dropped,data_frames_duplicated,data_frames_reordered,control_acks_sent,recovery_time_ms,goodput_bytes_per_sec,overhead_ratio"
+        )
+        .context("failed to write CSV header")?;
+    }
+
+    writeln!(
+        file,
+        "{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.4}",
+        metrics.finished_at_unix_ms,
+        metrics.peer,
+        metrics.session_id,
+        metrics.transfer_length,
+        metrics.symbol_size,
+        metrics.min_symbols_required,
+        metrics.data_frames_ingested,
+        metrics.data_frames_dropped,
+        metrics.data_frames_duplicated,
+        metrics.data_frames_reordered,
+        metrics.control_acks_sent,
+        metrics.recovery_time_ms,
+        metrics.goodput_bytes_per_sec,
+        metrics.overhead_ratio,
+    )
+    .context("failed to write CSV row")?;
+
+    Ok(())
 }
 
 impl DirtyNetwork {

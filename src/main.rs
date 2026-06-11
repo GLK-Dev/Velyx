@@ -14,7 +14,7 @@ use velyx::{
 };
 use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
-    StreamSender,
+    StreamSender, StreamTelemetry, append_metrics_csv,
 };
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -30,6 +30,12 @@ struct PeerSession {
     control_assembler: ControlAssembler,
     stream_receiver: StreamReceiver,
     reorder_hold: Option<VwpFrame>,
+    telemetry: StreamTelemetry,
+}
+
+struct ResponderOptions {
+    chaos: Option<ChaosConfig>,
+    metrics_csv: Option<String>,
 }
 
 #[tokio::main]
@@ -52,12 +58,12 @@ async fn main() -> Result<()> {
 
     match mode {
         "responder" => {
-            let chaos = parse_chaos_config(&args)?;
-            let chaos_middleware = match chaos {
+            let opts = parse_responder_options(&args)?;
+            let chaos_middleware = match opts.chaos {
                 Some(cfg) => Some(DirtyNetwork::new(cfg, 0xC0FFEE)?),
                 None => None,
             };
-            run_responder(bind_addr, chaos_middleware).await
+            run_responder(bind_addr, chaos_middleware, opts.metrics_csv).await
         }
         "initiator" => {
             if args.len() < 4 {
@@ -81,12 +87,16 @@ fn print_usage() {
     println!("  velyx responder 0.0.0.0:9000");
     println!("  velyx responder 0.0.0.0:9000 --chaos-drop-data-pct 30");
     println!("  velyx responder 0.0.0.0:9000 --chaos-scope all --chaos-jitter-ms 20 --chaos-reorder-pct 10");
+    println!("  velyx responder 0.0.0.0:9000 --metrics-csv ./metrics.csv --chaos-drop-data-pct 30");
     println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000");
 }
 
-fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
+fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
     if args.len() == 3 {
-        return Ok(None);
+        return Ok(ResponderOptions {
+            chaos: None,
+            metrics_csv: None,
+        });
     }
 
     let mut cfg = ChaosConfig {
@@ -98,6 +108,7 @@ fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
         jitter_ms: 0,
         scope: ChaosScope::DataOnly,
     };
+    let mut metrics_csv = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -134,6 +145,9 @@ fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
                     other => bail!("invalid chaos scope: {other}; expected data|all"),
                 }
             }
+            "--metrics-csv" => {
+                metrics_csv = Some(args[i + 1].to_string());
+            }
             other => {
                 print_usage();
                 bail!("unknown responder option: {other}");
@@ -143,7 +157,10 @@ fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
         i += 2;
     }
 
-    Ok(Some(cfg.validate()?))
+    Ok(ResponderOptions {
+        chaos: Some(cfg.validate()?),
+        metrics_csv,
+    })
 }
 
 fn parse_u8_opt(name: &str, value: &str) -> Result<u8> {
@@ -169,7 +186,11 @@ fn noise_private_key() -> Result<Vec<u8>> {
     Ok(keypair.private)
 }
 
-async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Result<()> {
+async fn run_responder(
+    bind_addr: &str,
+    mut chaos: Option<DirtyNetwork>,
+    metrics_csv: Option<String>,
+) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind responder socket on {bind_addr}"))?;
@@ -310,6 +331,9 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 && chaos_network.should_drop(vwp.frame_type)
             {
                 println!("[{remote}] Chaos middleware dropped incoming {:?} frame", vwp.frame_type);
+                if vwp.frame_type == VwpFrameType::Data {
+                    session.telemetry.on_data_drop();
+                }
                 continue;
             }
 
@@ -321,6 +345,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                     // Process current first and delayed packet second to simulate reordering.
                     frames_to_process.push(vwp);
                     frames_to_process.push(held);
+                    session.telemetry.on_data_reordered();
                 } else {
                     println!("[{remote}] Chaos middleware buffered frame for reordering");
                     continue;
@@ -342,6 +367,13 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 }
                 if !duplicated.is_empty() {
                     println!("[{remote}] Chaos middleware duplicated {} frame(s)", duplicated.len());
+                    let data_dupes = duplicated
+                        .iter()
+                        .filter(|f| f.frame_type == VwpFrameType::Data)
+                        .count() as u64;
+                    if data_dupes > 0 {
+                        session.telemetry.on_data_duplicated(data_dupes);
+                    }
                 }
                 frames_to_process.extend(duplicated);
             }
@@ -410,6 +442,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                         println!("Failed to send ACK packet to {remote}: {err}");
                         continue;
                     }
+                    session.telemetry.on_control_ack_sent();
 
                     let assembled = match session.control_assembler.push_chunk(chunk) {
                         Ok(result) => result,
@@ -429,6 +462,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                         match session.stream_receiver.on_control_payload(&full) {
                             Ok(StreamControlEvent::Started) => {
                                 if let Ok(StreamCommand::StreamStart(cfg)) = StreamCommand::decode(&full) {
+                                    session.telemetry.on_stream_start(cfg);
                                     println!(
                                         "[{remote}] Stream started: symbol_size={}, transfer_length={}",
                                         cfg.symbol_size(),
@@ -455,10 +489,23 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 VwpFrameType::Data => {
                     match session.stream_receiver.ingest_data_packet(&vwp.payload) {
                         Ok(Some(decoded)) => {
+                        session.telemetry.on_data_ingested();
                         println!(
                             "[{remote}] RaptorQ decode complete, recovered {} bytes",
                             decoded.len()
                         );
+
+                        if let Some(path) = metrics_csv.as_deref()
+                            && let Some(metrics) = session
+                                .telemetry
+                                .finalize(remote.to_string(), session.session_id, decoded.len())
+                        {
+                            if let Err(err) = append_metrics_csv(path, &metrics) {
+                                println!("Failed to append metrics CSV row: {err}");
+                            } else {
+                                println!("[{remote}] Metrics exported to {path}");
+                            }
+                        }
 
                         let stop_frames = match chunk_control_message(
                             vwp.stream_id,
@@ -551,7 +598,9 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                             println!("Failed to send data reply to {remote}: {err}");
                         }
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            session.telemetry.on_data_ingested();
+                        }
                         Err(err) => {
                             println!("[{remote}] Failed to ingest data packet: {err}");
                         }
@@ -665,6 +714,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 control_assembler: ControlAssembler::default(),
                 stream_receiver: StreamReceiver::default(),
                 reorder_hold: None,
+                telemetry: StreamTelemetry::default(),
             },
         );
 

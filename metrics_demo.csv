@@ -1,0 +1,2 @@
+finished_at_unix_ms,peer,session_id,transfer_length,symbol_size,min_symbols_required,data_frames_ingested,data_frames_dropped,data_frames_duplicated,data_frames_reordered,control_acks_sent,recovery_time_ms,goodput_bytes_per_sec,overhead_ratio
+1781181793905,127.0.0.1:62985,16668402537326118024,10800,1296,9,9,2,0,0,0,297,36363.64,1.0000
