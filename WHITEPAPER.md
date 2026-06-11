@@ -116,6 +116,8 @@ This removes strict dependence on rare block availability and improves recovery 
 2. VEP process (Velyx Enhancement Proposals).
 3. Security audits, reproducible builds, and interop test vectors.
 4. Initial normative draft: VEP-001 (wire format and capability negotiation).
+5. Capability registry draft: VEP-002.
+6. Error and ACK semantics draft: VEP-003.
 
 ## 9. MVP Scope (Current Implementation)
 1. Peer ID generation (Ed25519).
