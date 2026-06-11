@@ -424,6 +424,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "raptorq"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cc8cd0bcb2d520fff368264b5a6295e064c60955349517d09b14473afae4856"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -643,6 +649,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "rand_core",
+ "raptorq",
  "serde",
  "serde_json",
  "snow",

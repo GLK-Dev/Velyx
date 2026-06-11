@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 
+pub mod stream;
+
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"VLYX";
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 28;

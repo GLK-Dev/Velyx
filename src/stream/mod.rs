@@ -1,0 +1,284 @@
+use anyhow::{Context, Result, bail};
+use raptorq::{Decoder as RaptorDecoder, Encoder as RaptorEncoder, EncodingPacket, ObjectTransmissionInformation};
+
+use crate::{VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message};
+
+pub const CMD_STREAM_START: u8 = 1;
+pub const CMD_STOP_STREAM: u8 = 2;
+
+#[derive(Debug, Clone)]
+pub enum StreamCommand {
+    StreamStart(ObjectTransmissionInformation),
+    StopStream,
+}
+
+impl StreamCommand {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::StreamStart(config) => {
+                let mut payload = Vec::with_capacity(13);
+                payload.push(CMD_STREAM_START);
+                payload.extend_from_slice(&config.serialize());
+                payload
+            }
+            Self::StopStream => vec![CMD_STOP_STREAM],
+        }
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.is_empty() {
+            bail!("empty stream command payload");
+        }
+
+        match payload[0] {
+            CMD_STREAM_START => {
+                if payload.len() != 13 {
+                    bail!("invalid STREAM_START payload length: {}", payload.len());
+                }
+                let mut oti = [0u8; 12];
+                oti.copy_from_slice(&payload[1..13]);
+                Ok(Self::StreamStart(ObjectTransmissionInformation::deserialize(
+                    &oti,
+                )))
+            }
+            CMD_STOP_STREAM => {
+                if payload.len() != 1 {
+                    bail!("invalid STOP_STREAM payload length: {}", payload.len());
+                }
+                Ok(Self::StopStream)
+            }
+            other => bail!("unknown stream command: {other}"),
+        }
+    }
+}
+
+pub struct StreamSender {
+    packets: Vec<Vec<u8>>,
+    next_packet: usize,
+    next_seq: u32,
+    stream_start: StreamCommand,
+    stream_id: [u8; VWP_STREAM_ID_LEN],
+}
+
+impl StreamSender {
+    pub fn new(
+        stream_id: [u8; VWP_STREAM_ID_LEN],
+        data: &[u8],
+        mtu: u16,
+        initial_data_seq: u32,
+        repair_packets_per_block: u32,
+    ) -> Result<Self> {
+        let encoder = RaptorEncoder::with_defaults(data, mtu);
+        let config = encoder.get_config();
+        let packets = encoder
+            .get_encoded_packets(repair_packets_per_block)
+            .into_iter()
+            .map(|p| p.serialize())
+            .collect::<Vec<_>>();
+
+        if packets.is_empty() {
+            bail!("raptor encoder produced no packets");
+        }
+
+        Ok(Self {
+            packets,
+            next_packet: 0,
+            next_seq: initial_data_seq,
+            stream_start: StreamCommand::StreamStart(config),
+            stream_id,
+        })
+    }
+
+    pub fn stream_start_frames(&self, message_id: u32, start_seq: u32) -> Result<Vec<VwpFrame>> {
+        let payload = self.stream_start.encode();
+        chunk_control_message(self.stream_id, message_id, start_seq, &payload)
+            .context("failed to chunk STREAM_START control payload")
+    }
+
+    pub fn next_data_frame(&mut self) -> VwpFrame {
+        let payload = self.packets[self.next_packet % self.packets.len()].clone();
+        self.next_packet = (self.next_packet + 1) % self.packets.len();
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+
+        VwpFrame {
+            frame_type: VwpFrameType::Data,
+            seq,
+            stream_id: self.stream_id,
+            payload,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct StreamReceiver {
+    decoder: Option<RaptorDecoder>,
+    done: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamControlEvent {
+    Started,
+    Stopped,
+    Ignored,
+}
+
+impl StreamReceiver {
+    pub fn on_control_payload(&mut self, payload: &[u8]) -> Result<StreamControlEvent> {
+        let cmd = StreamCommand::decode(payload)?;
+        match cmd {
+            StreamCommand::StreamStart(config) => {
+                self.decoder = Some(RaptorDecoder::new(config));
+                self.done = false;
+                Ok(StreamControlEvent::Started)
+            }
+            StreamCommand::StopStream => {
+                self.done = true;
+                self.decoder = None;
+                Ok(StreamControlEvent::Stopped)
+            }
+        }
+    }
+
+    pub fn ingest_data_packet(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Ok(None);
+        };
+
+        if payload.len() < 4 {
+            bail!("raptor payload too short");
+        }
+
+        let packet = EncodingPacket::deserialize(payload);
+        let decoded = decoder.decode(packet);
+        if decoded.is_some() {
+            self.done = true;
+        }
+        Ok(decoded)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChaosConfig {
+    pub drop_data_pct: u8,
+    pub drop_control_pct: u8,
+    pub drop_ack_pct: u8,
+}
+
+impl ChaosConfig {
+    pub fn validate(self) -> Result<Self> {
+        for (label, value) in [
+            ("drop_data_pct", self.drop_data_pct),
+            ("drop_control_pct", self.drop_control_pct),
+            ("drop_ack_pct", self.drop_ack_pct),
+        ] {
+            if value > 100 {
+                bail!("{label} must be <= 100, got {value}");
+            }
+        }
+        Ok(self)
+    }
+}
+
+pub struct DirtyNetwork {
+    config: ChaosConfig,
+    state: u64,
+}
+
+impl DirtyNetwork {
+    pub fn new(config: ChaosConfig, seed: u64) -> Result<Self> {
+        Ok(Self {
+            config: config.validate()?,
+            state: if seed == 0 { 0xA5A5_1337_55AA_F00D } else { seed },
+        })
+    }
+
+    pub fn should_drop(&mut self, frame_type: VwpFrameType) -> bool {
+        let pct = match frame_type {
+            VwpFrameType::Data => self.config.drop_data_pct,
+            VwpFrameType::Control => self.config.drop_control_pct,
+            VwpFrameType::Ack => self.config.drop_ack_pct,
+        };
+
+        if pct == 0 {
+            return false;
+        }
+
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        let sample = ((self.state >> 32) as u32) % 100;
+        sample < pct as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ControlChunk;
+
+    #[test]
+    fn chaos_monkey_50_percent_loss_still_recovers() {
+        let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
+        stream_id[0] = 9;
+        let data = b"velyx-chaos-monkey-raptorq".repeat(1024);
+
+        let mut sender = StreamSender::new(stream_id, &data, 1300, 0, 32).expect("sender");
+        let mut receiver = StreamReceiver::default();
+        let mut chaos = DirtyNetwork::new(
+            ChaosConfig {
+                drop_data_pct: 50,
+                drop_control_pct: 0,
+                drop_ack_pct: 0,
+            },
+            42,
+        )
+        .expect("chaos");
+
+        let start_payload = sender
+            .stream_start
+            .encode();
+        receiver
+            .on_control_payload(&start_payload)
+            .expect("stream start");
+
+        let mut decoded = None;
+        for _ in 0..10000 {
+            let frame = sender.next_data_frame();
+            if chaos.should_drop(frame.frame_type) {
+                continue;
+            }
+            decoded = receiver
+                .ingest_data_packet(&frame.payload)
+                .expect("ingest data");
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        let recovered = decoded.expect("recovered payload under packet loss");
+        assert_eq!(recovered, data);
+        assert!(receiver.is_done());
+    }
+
+    #[test]
+    fn stream_start_frames_are_control_frames() {
+        let stream_id = [1u8; VWP_STREAM_ID_LEN];
+        let sender = StreamSender::new(stream_id, b"abc", 1300, 0, 2).expect("sender");
+        let frames = sender.stream_start_frames(1, 0).expect("frames");
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|f| f.frame_type == VwpFrameType::Control));
+        let chunk = ControlChunk::decode(&frames[0].payload).expect("chunk");
+        assert_eq!(chunk.message_id, 1);
+    }
+}

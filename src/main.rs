@@ -5,11 +5,15 @@ use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
+use tokio::time::{Duration, timeout};
 use velyx::{
     CAP_OBFS_V1, CAP_RELAY_V1, CapabilitySet, ClientFinish, ClientHello, ControlAck,
     ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
     ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
     chunk_control_message, negotiate, parse_server_and_validate,
+};
+use velyx::stream::{
+    ChaosConfig, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver, StreamSender,
 };
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -23,6 +27,7 @@ struct PeerSession {
     handshake: Option<HandshakeState>,
     transport: Option<TransportState>,
     control_assembler: ControlAssembler,
+    stream_receiver: StreamReceiver,
 }
 
 #[tokio::main]
@@ -44,7 +49,14 @@ async fn main() -> Result<()> {
     println!("Peer ID (ed25519): {peer_id}");
 
     match mode {
-        "responder" => run_responder(bind_addr).await,
+        "responder" => {
+            let chaos = parse_chaos_config(&args)?;
+            let chaos_middleware = match chaos {
+                Some(cfg) => Some(DirtyNetwork::new(cfg, 0xC0FFEE)?),
+                None => None,
+            };
+            run_responder(bind_addr, chaos_middleware).await
+        }
         "initiator" => {
             if args.len() < 4 {
                 print_usage();
@@ -61,11 +73,32 @@ async fn main() -> Result<()> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  velyx responder <bind_addr>");
+    println!("  velyx responder <bind_addr> [--chaos-drop-data-pct <0-100>]");
     println!("  velyx initiator <bind_addr> <remote_addr>");
     println!("Examples:");
     println!("  velyx responder 0.0.0.0:9000");
+    println!("  velyx responder 0.0.0.0:9000 --chaos-drop-data-pct 30");
     println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000");
+}
+
+fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
+    if args.len() == 3 {
+        return Ok(None);
+    }
+    if args.len() != 5 || args[3] != "--chaos-drop-data-pct" {
+        print_usage();
+        bail!("invalid responder options");
+    }
+
+    let drop_data_pct: u8 = args[4]
+        .parse()
+        .with_context(|| format!("invalid chaos drop percentage: {}", args[4]))?;
+
+    Ok(Some(ChaosConfig {
+        drop_data_pct,
+        drop_control_pct: 0,
+        drop_ack_pct: 0,
+    }))
 }
 
 fn local_caps() -> CapabilitySet {
@@ -85,7 +118,7 @@ fn noise_private_key() -> Result<Vec<u8>> {
     Ok(keypair.private)
 }
 
-async fn run_responder(bind_addr: &str) -> Result<()> {
+async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind responder socket on {bind_addr}"))?;
@@ -288,9 +321,103 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                     };
 
                     if let Some(full) = assembled {
-                        let as_text = String::from_utf8_lossy(&full);
                         println!("[{remote}] Assembled control payload ({} bytes)", full.len());
-                        println!("[{remote}] Control text: {as_text}");
+                        if full.is_empty() {
+                            println!("[{remote}] Empty control payload");
+                            continue;
+                        }
+
+                        match session.stream_receiver.on_control_payload(&full) {
+                            Ok(StreamControlEvent::Started) => {
+                                if let Ok(StreamCommand::StreamStart(cfg)) = StreamCommand::decode(&full) {
+                                    println!(
+                                        "[{remote}] Stream started: symbol_size={}, transfer_length={}",
+                                        cfg.symbol_size(),
+                                        cfg.transfer_length()
+                                    );
+                                }
+                            }
+                            Ok(StreamControlEvent::Stopped) => {
+                                println!("[{remote}] Stream stopped by remote request");
+                            }
+                            Ok(StreamControlEvent::Ignored) => {
+                                let as_text = String::from_utf8_lossy(&full);
+                                println!("[{remote}] Control payload ignored: {as_text}");
+                            }
+                            Err(err) => {
+                                println!("[{remote}] Invalid stream control payload: {err}");
+                            }
+                        }
+                    }
+                }
+                VwpFrameType::Ack => {
+                    println!("[{remote}] Received ACK frame on responder side");
+                }
+                VwpFrameType::Data => {
+                    if let Some(chaos_network) = chaos.as_mut()
+                        && chaos_network.should_drop(VwpFrameType::Data)
+                    {
+                        println!("[{remote}] Chaos middleware dropped incoming Data frame");
+                        continue;
+                    }
+
+                    match session.stream_receiver.ingest_data_packet(&vwp.payload) {
+                        Ok(Some(decoded)) => {
+                        println!(
+                            "[{remote}] RaptorQ decode complete, recovered {} bytes",
+                            decoded.len()
+                        );
+
+                        let stop_frames = match chunk_control_message(
+                            vwp.stream_id,
+                            2,
+                            session.vwp_tx_seq,
+                            &StreamCommand::StopStream.encode(),
+                        ) {
+                            Ok(frames) => frames,
+                            Err(err) => {
+                                println!("Failed to build STOP_STREAM frame for {remote}: {err}");
+                                continue;
+                            }
+                        };
+
+                        for frame in stop_frames {
+                            session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
+                            let raw = match frame.encode() {
+                                Ok(raw) => raw,
+                                Err(err) => {
+                                    println!("Failed to encode STOP_STREAM VWP frame: {err}");
+                                    break;
+                                }
+                            };
+                            let wire_len = match transport.write_message(&raw, &mut out_buf) {
+                                Ok(len) => len,
+                                Err(err) => {
+                                    println!("Failed to encrypt STOP_STREAM frame: {err}");
+                                    break;
+                                }
+                            };
+                            let pkt = WirePacket {
+                                version: PROTOCOL_VERSION,
+                                packet_type: PacketType::Data,
+                                flags: 0,
+                                session_id: session.session_id,
+                                seq: session.tx_seq,
+                                payload: out_buf[..wire_len].to_vec(),
+                            };
+                            session.tx_seq += 1;
+                            let pkt_raw = match pkt.encode() {
+                                Ok(raw) => raw,
+                                Err(err) => {
+                                    println!("Failed to encode STOP_STREAM packet: {err}");
+                                    break;
+                                }
+                            };
+                            if let Err(err) = socket.send_to(&pkt_raw, remote).await {
+                                println!("Failed to send STOP_STREAM packet to {remote}: {err}");
+                                break;
+                            }
+                        }
 
                         let data_frame = VwpFrame {
                             frame_type: VwpFrameType::Data,
@@ -299,7 +426,6 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                             payload: b"velyx-pong".to_vec(),
                         };
                         session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
-
                         let data_wire_len = match data_frame.encode() {
                             Ok(bytes) => match transport.write_message(&bytes, &mut out_buf) {
                                 Ok(n) => n,
@@ -313,7 +439,6 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                                 continue;
                             }
                         };
-
                         let reply_packet = WirePacket {
                             version: PROTOCOL_VERSION,
                             packet_type: PacketType::Data,
@@ -333,14 +458,12 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                         if let Err(err) = socket.send_to(&reply_raw, remote).await {
                             println!("Failed to send data reply to {remote}: {err}");
                         }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            println!("[{remote}] Failed to ingest data packet: {err}");
+                        }
                     }
-                }
-                VwpFrameType::Ack => {
-                    println!("[{remote}] Received ACK frame on responder side");
-                }
-                VwpFrameType::Data => {
-                    let incoming = String::from_utf8_lossy(&vwp.payload);
-                    println!("[{remote}] Data frame payload: {incoming}");
                 }
             }
             continue;
@@ -447,6 +570,7 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                 handshake: Some(hs),
                 transport: None,
                 control_assembler: ControlAssembler::default(),
+                stream_receiver: StreamReceiver::default(),
             },
         );
 
@@ -562,9 +686,10 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
     let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
     stream_id[0..8].copy_from_slice(&session_id.to_be_bytes());
 
-    let control_payload = b"control: metadata handshake for swarm bootstrap over reliable chunks";
-    let control_frames = chunk_control_message(stream_id, 1, 0, control_payload)
-        .context("failed to chunk control payload")?;
+    let data_blob = b"velyx fountain stream payload for MVP demo. this data is intentionally repeated to exceed one symbol size and validate decode behavior."
+        .repeat(80);
+    let mut stream_sender = StreamSender::new(stream_id, &data_blob, 1300, 0, 24)?;
+    let control_frames = stream_sender.stream_start_frames(1, 0)?;
     let expected_acks = control_frames.len();
 
     for control_frame in &control_frames {
@@ -589,11 +714,51 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
     }
 
     let mut acked_chunks = 0usize;
+    let mut vwp_data_seq = control_frames.len() as u32;
+    let mut stop_received = false;
+    let mut local_control_assembler = ControlAssembler::default();
+    let mut sent_frames = 0usize;
+
+    // Data frames start after control frame sequence space.
+    stream_sender = StreamSender::new(stream_id, &data_blob, 1300, vwp_data_seq, 24)?;
+
     loop {
-        let (resp_len, from3) = socket
-            .recv_from(&mut in_buf)
+        let data_frame = stream_sender.next_data_frame();
+        vwp_data_seq = data_frame.seq.wrapping_add(1);
+        sent_frames += 1;
+
+        let vwp_raw = data_frame.encode().context("encode VWP data frame")?;
+        let enc_len = transport
+            .write_message(&vwp_raw, &mut out_buf)
+            .context("failed to encrypt VWP data frame")?;
+        let data_pkt = WirePacket {
+            version: PROTOCOL_VERSION,
+            packet_type: PacketType::Data,
+            flags: 0,
+            session_id,
+            seq: tx_seq,
+            payload: out_buf[..enc_len].to_vec(),
+        };
+        tx_seq += 1;
+        socket
+            .send_to(&data_pkt.encode()?, remote)
             .await
-            .context("failed to receive encrypted response")?;
+            .context("failed to send raptor data frame")?;
+
+        // MVP pacing to avoid local UDP queue overflow.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let recv_result = timeout(Duration::from_millis(2), socket.recv_from(&mut in_buf)).await;
+        let Ok(Ok((resp_len, from3))) = recv_result else {
+            if sent_frames > 1000 && acked_chunks >= expected_acks {
+                println!("No STOP_STREAM yet, continuing fire-and-forget stream...");
+            }
+            if sent_frames > 10000 {
+                println!("MVP safety break after extended streaming window");
+                break;
+            }
+            continue;
+        };
         if from3 != remote {
             bail!("response source mismatch: expected {remote}, got {from3}");
         }
@@ -625,13 +790,60 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
             VwpFrameType::Data => {
                 let response = String::from_utf8_lossy(&frame.payload);
                 println!("Received VWP data response: {response}");
-                if acked_chunks >= expected_acks {
-                    break;
-                }
             }
             VwpFrameType::Control => {
-                println!("Received unexpected control frame from responder");
+                let chunk = ControlChunk::decode(&frame.payload).context("decode control chunk")?;
+
+                let ack = ControlAck {
+                    message_id: chunk.message_id,
+                    chunk_index: chunk.chunk_index,
+                };
+                let ack_frame = VwpFrame {
+                    frame_type: VwpFrameType::Ack,
+                    seq: vwp_data_seq,
+                    stream_id,
+                    payload: ack.encode().to_vec(),
+                };
+
+                let ack_vwp_raw = ack_frame.encode().context("encode ACK frame")?;
+                let ack_wire_len = transport
+                    .write_message(&ack_vwp_raw, &mut out_buf)
+                    .context("encrypt ACK frame")?;
+                let ack_pkt = WirePacket {
+                    version: PROTOCOL_VERSION,
+                    packet_type: PacketType::Data,
+                    flags: 0,
+                    session_id,
+                    seq: tx_seq,
+                    payload: out_buf[..ack_wire_len].to_vec(),
+                };
+                tx_seq += 1;
+                socket
+                    .send_to(&ack_pkt.encode()?, remote)
+                    .await
+                    .context("send control ACK to responder")?;
+
+                let assembled = local_control_assembler.push_chunk(chunk)?;
+
+                if let Some(full) = assembled {
+                    match StreamCommand::decode(&full) {
+                        Ok(StreamCommand::StopStream) => {
+                            println!("Received STOP_STREAM from responder");
+                            stop_received = true;
+                        }
+                        Ok(StreamCommand::StreamStart(_)) => {
+                            println!("Received unexpected STREAM_START from responder");
+                        }
+                        Err(err) => {
+                            println!("Failed to decode responder control command: {err}");
+                        }
+                    }
+                }
             }
+        }
+
+        if stop_received && acked_chunks >= expected_acks {
+            break;
         }
     }
 
