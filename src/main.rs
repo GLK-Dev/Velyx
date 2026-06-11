@@ -23,6 +23,8 @@ use velyx::stream::{
 use velyx::dht_bridge::{execute_dht_action, send_control_command};
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const DHT_DISCOVERY_INITIAL_DELAY: Duration = Duration::from_millis(800);
+const DHT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SessionState {
@@ -50,6 +52,7 @@ struct PeerSession {
     stream_receiver: StreamReceiver,
     last_stream_id: [u8; VWP_STREAM_ID_LEN],
     next_dht_message_id: u32,
+    next_discovery_at: std::time::Instant,
     reorder_hold: Option<VwpFrame>,
     telemetry: StreamTelemetry,
     state: SessionState,
@@ -885,6 +888,7 @@ async fn run_responder(
                         stream_receiver: StreamReceiver::default(),
                         last_stream_id: [0u8; VWP_STREAM_ID_LEN],
                         next_dht_message_id: 100,
+                        next_discovery_at: std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY,
                         control_assembler: ControlAssembler::default(),
                         reorder_hold: None,
                         telemetry: StreamTelemetry::default(),
@@ -903,6 +907,8 @@ async fn run_responder(
             // Timeout on recv, handle retransmits
         }
     } // close match recv_result
+
+        let now = std::time::Instant::now();
 
         if !pending_dht_actions.is_empty() {
             let actions = std::mem::take(&mut pending_dht_actions);
@@ -956,8 +962,46 @@ async fn run_responder(
             }
         }
 
+        // Active discovery loop: periodically ask peers for nodes near our own ID.
+        for (peer_addr, session) in peers.iter_mut() {
+            if session.state != SessionState::Active {
+                continue;
+            }
+            if session.last_stream_id == [0u8; VWP_STREAM_ID_LEN] {
+                continue;
+            }
+            if now < session.next_discovery_at {
+                continue;
+            }
+
+            let Some(transport) = session.transport.as_mut() else {
+                continue;
+            };
+
+            let message_id = session.next_dht_message_id;
+            session.next_dht_message_id = session.next_dht_message_id.wrapping_add(1);
+            if let Err(err) = send_control_command(
+                &socket,
+                transport,
+                &mut out_buf,
+                session.session_id,
+                &mut session.tx_seq,
+                &mut session.vwp_tx_seq,
+                session.last_stream_id,
+                message_id,
+                *peer_addr,
+                StreamCommand::FindNode {
+                    target_id: local_node_id,
+                },
+            )
+            .await
+            {
+                println!("[{peer_addr}] Active discovery FIND_NODE send failed: {err}");
+            }
+            session.next_discovery_at = now + DHT_DISCOVERY_INTERVAL;
+        }
+
         // Handle retransmits for Closing sessions
-        let now = std::time::Instant::now();
         let mut to_remove = Vec::new();
         for (peer_addr, session) in peers.iter_mut() {
             // Clean up Closed sessions
@@ -1207,6 +1251,7 @@ async fn run_initiator(
     let mut dht = RoutingTable::new(local_node_id, 20);
     let mut dht_routes: HashMap<NodeId, ([u8; VWP_STREAM_ID_LEN], SocketAddr)> = HashMap::new();
     let mut next_dht_message_id = 100u32;
+    let mut next_discovery_at = std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY;
     let mut sent_frames = 0usize;
     let mut logged_waiting_for_stop = false;
 
@@ -1245,6 +1290,30 @@ async fn run_initiator(
             }
         } else {
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Initiator-side active discovery: periodically request neighbors near self.
+        let now = std::time::Instant::now();
+        if now >= next_discovery_at {
+            let message_id = next_dht_message_id;
+            next_dht_message_id = next_dht_message_id.wrapping_add(1);
+            send_control_command(
+                &socket,
+                &mut transport,
+                &mut out_buf,
+                session_id,
+                &mut tx_seq,
+                &mut vwp_data_seq,
+                stream_id,
+                message_id,
+                remote,
+                StreamCommand::FindNode {
+                    target_id: local_node_id,
+                },
+            )
+            .await
+            .context("send periodic DHT FIND_NODE")?;
+            next_discovery_at = now + DHT_DISCOVERY_INTERVAL;
         }
 
         let poll_timeout = if acked_chunks >= expected_acks { 12 } else { 3 };
