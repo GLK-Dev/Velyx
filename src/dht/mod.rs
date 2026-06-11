@@ -67,6 +67,17 @@ pub enum InsertOutcome {
     IgnoredSelf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingAction {
+    Ping(NodeId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingResult<T> {
+    pub value: T,
+    pub actions: Vec<RoutingAction>,
+}
+
 #[derive(Debug, Clone)]
 struct Bucket {
     nodes: VecDeque<NodeId>,
@@ -125,9 +136,12 @@ impl RoutingTable {
         self.local_id.bucket_index(node_id)
     }
 
-    pub fn insert(&mut self, node_id: NodeId) -> InsertOutcome {
+    pub fn insert_with_actions(&mut self, node_id: NodeId) -> RoutingResult<InsertOutcome> {
         let Some(bucket_index) = self.bucket_index_for(&node_id) else {
-            return InsertOutcome::IgnoredSelf;
+            return RoutingResult {
+                value: InsertOutcome::IgnoredSelf,
+                actions: Vec::new(),
+            };
         };
 
         let bucket = &mut self.buckets[bucket_index as usize];
@@ -137,7 +151,10 @@ impl RoutingTable {
                 .remove(pos)
                 .expect("node index from position must exist");
             bucket.nodes.push_back(existing);
-            return InsertOutcome::AlreadyPresent { bucket_index };
+            return RoutingResult {
+                value: InsertOutcome::AlreadyPresent { bucket_index },
+                actions: Vec::new(),
+            };
         }
 
         if bucket.nodes.len() >= self.k {
@@ -157,25 +174,41 @@ impl RoutingTable {
                 new_candidate: node_id,
             });
 
-            return InsertOutcome::PendingPing {
-                bucket_index,
-                stale_node,
-                new_candidate: node_id,
+            return RoutingResult {
+                value: InsertOutcome::PendingPing {
+                    bucket_index,
+                    stale_node,
+                    new_candidate: node_id,
+                },
+                actions: vec![RoutingAction::Ping(stale_node)],
             };
         }
 
         bucket.nodes.push_back(node_id);
-        InsertOutcome::Inserted { bucket_index }
+        RoutingResult {
+            value: InsertOutcome::Inserted { bucket_index },
+            actions: Vec::new(),
+        }
     }
 
-    pub fn mark_active(&mut self, node_id: NodeId) -> bool {
+    pub fn insert(&mut self, node_id: NodeId) -> InsertOutcome {
+        self.insert_with_actions(node_id).value
+    }
+
+    pub fn mark_active_with_actions(&mut self, node_id: NodeId) -> RoutingResult<bool> {
         let Some(bucket_index) = self.bucket_index_for(&node_id) else {
-            return false;
+            return RoutingResult {
+                value: false,
+                actions: Vec::new(),
+            };
         };
 
         let bucket = &mut self.buckets[bucket_index as usize];
         let Some(pos) = bucket.nodes.iter().position(|n| *n == node_id) else {
-            return false;
+            return RoutingResult {
+                value: false,
+                actions: Vec::new(),
+            };
         };
 
         let node = bucket
@@ -197,28 +230,51 @@ impl RoutingTable {
             }
         }
 
-        true
+        RoutingResult {
+            value: true,
+            actions: Vec::new(),
+        }
     }
 
-    pub fn replace_stale(&mut self, dead_node: NodeId, new_candidate: NodeId) -> bool {
+    pub fn mark_active(&mut self, node_id: NodeId) -> bool {
+        self.mark_active_with_actions(node_id).value
+    }
+
+    pub fn replace_stale_with_actions(
+        &mut self,
+        dead_node: NodeId,
+        new_candidate: NodeId,
+    ) -> RoutingResult<bool> {
         let Some(bucket_index) = self.bucket_index_for(&dead_node) else {
-            return false;
+            return RoutingResult {
+                value: false,
+                actions: Vec::new(),
+            };
         };
 
         if self.bucket_index_for(&new_candidate) != Some(bucket_index) {
-            return false;
+            return RoutingResult {
+                value: false,
+                actions: Vec::new(),
+            };
         }
 
         let bucket = &mut self.buckets[bucket_index as usize];
 
         if let Some(pending) = bucket.pending {
             if pending.stale_node == dead_node && pending.new_candidate != new_candidate {
-                return false;
+                return RoutingResult {
+                    value: false,
+                    actions: Vec::new(),
+                };
             }
         }
 
         let Some(dead_pos) = bucket.nodes.iter().position(|n| *n == dead_node) else {
-            return false;
+            return RoutingResult {
+                value: false,
+                actions: Vec::new(),
+            };
         };
 
         bucket.nodes.remove(dead_pos);
@@ -230,7 +286,15 @@ impl RoutingTable {
             bucket.replacements.remove(rep_pos);
         }
         bucket.pending = None;
-        true
+        RoutingResult {
+            value: true,
+            actions: Vec::new(),
+        }
+    }
+
+    pub fn replace_stale(&mut self, dead_node: NodeId, new_candidate: NodeId) -> bool {
+        self.replace_stale_with_actions(dead_node, new_candidate)
+            .value
     }
 
     pub fn bucket_len(&self, bucket_index: u8) -> usize {
@@ -322,7 +386,8 @@ mod tests {
         overflow[31] = 200;
         let overflow_id = NodeId::from_bytes(overflow);
 
-        let outcome = table.insert(overflow_id);
+        let result = table.insert_with_actions(overflow_id);
+        let outcome = result.value;
         assert_eq!(
             outcome,
             InsertOutcome::PendingPing {
@@ -331,6 +396,7 @@ mod tests {
                 new_candidate: overflow_id,
             }
         );
+        assert_eq!(result.actions, vec![RoutingAction::Ping(oldest_id)]);
         assert_eq!(table.bucket_len(255), 20);
     }
 
@@ -398,5 +464,40 @@ mod tests {
 
         assert!(table.replace_stale(a, c));
         assert_eq!(table.bucket_nodes(255), vec![b, c]);
+    }
+
+    #[test]
+    fn insert_with_actions_emits_ping_for_lru_head() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 2);
+
+        let mut a = [0u8; NODE_ID_LEN];
+        a[0] = 0x80;
+        a[31] = 1;
+        let a = NodeId::from_bytes(a);
+
+        let mut b = [0u8; NODE_ID_LEN];
+        b[0] = 0x80;
+        b[31] = 2;
+        let b = NodeId::from_bytes(b);
+
+        let mut c = [0u8; NODE_ID_LEN];
+        c[0] = 0x80;
+        c[31] = 3;
+        let c = NodeId::from_bytes(c);
+
+        table.insert(a);
+        table.insert(b);
+
+        let result = table.insert_with_actions(c);
+        assert_eq!(result.actions, vec![RoutingAction::Ping(a)]);
+        assert_eq!(
+            result.value,
+            InsertOutcome::PendingPing {
+                bucket_index: 255,
+                stale_node: a,
+                new_candidate: c,
+            }
+        );
     }
 }
