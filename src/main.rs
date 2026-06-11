@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
-mod dht_bridge;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::collections::HashMap;
@@ -21,7 +20,7 @@ use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
     StreamSender, StreamTelemetry, append_metrics_csv,
 };
-use crate::dht_bridge::{route_action_to_command, send_control_command};
+use velyx::dht_bridge::{execute_dht_action, send_control_command};
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
@@ -672,6 +671,41 @@ async fn run_responder(
                                 let mark_result = dht.mark_active_with_actions(sender_id);
                                 pending_dht_actions.extend(mark_result.actions);
                             }
+                            Ok(StreamCommand::FindNode { target_id }) => {
+                                println!(
+                                    "[{remote}] Received DHT FIND_NODE target_id={}",
+                                    hex::encode(target_id.as_bytes())
+                                );
+
+                                let closest = dht.lookup(target_id);
+                                let message_id = session.next_dht_message_id;
+                                session.next_dht_message_id =
+                                    session.next_dht_message_id.wrapping_add(1);
+                                if let Err(err) = send_control_command(
+                                    &socket,
+                                    transport,
+                                    &mut out_buf,
+                                    session.session_id,
+                                    &mut session.tx_seq,
+                                    &mut session.vwp_tx_seq,
+                                    session.last_stream_id,
+                                    message_id,
+                                    remote,
+                                    StreamCommand::NodesFound { nodes: closest },
+                                )
+                                .await
+                                {
+                                    println!("[{remote}] Failed to send DHT NODES_FOUND: {err}");
+                                }
+                            }
+                            Ok(StreamCommand::NodesFound { nodes }) => {
+                                println!(
+                                    "[{remote}] Received DHT NODES_FOUND count={}",
+                                    nodes.len()
+                                );
+                                let actions = dht.nodes_found_received(nodes);
+                                pending_dht_actions.extend(actions);
+                            }
                             Err(err) => {
                                 println!("[{remote}] Invalid stream control payload: {err}");
                             }
@@ -873,7 +907,11 @@ async fn run_responder(
         if !pending_dht_actions.is_empty() {
             let actions = std::mem::take(&mut pending_dht_actions);
             for action in actions {
-                let (target_id, command) = route_action_to_command(action, local_node_id);
+                let Some(executed) = execute_dht_action(action, local_node_id) else {
+                    continue;
+                };
+                let target_id = executed.target_id;
+                let command = executed.command;
                 let Some(target_addr) = dht_routes.get(&target_id).copied() else {
                     println!(
                         "Skipping DHT action: no known route for target_id={}",
@@ -1312,7 +1350,12 @@ async fn run_initiator(
 
                             let insert_result = dht.insert_with_actions(sender_id);
                             for action in insert_result.actions {
-                                let (target_id, command) = route_action_to_command(action, local_node_id);
+                                let Some(executed) = execute_dht_action(action, local_node_id)
+                                else {
+                                    continue;
+                                };
+                                let target_id = executed.target_id;
+                                let command = executed.command;
                                 let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
                                     println!(
                                         "Skipping DHT action: no known route for target_id={}",
@@ -1367,7 +1410,12 @@ async fn run_initiator(
 
                             let mark_result = dht.mark_active_with_actions(sender_id);
                             for action in mark_result.actions {
-                                let (target_id, command) = route_action_to_command(action, local_node_id);
+                                let Some(executed) = execute_dht_action(action, local_node_id)
+                                else {
+                                    continue;
+                                };
+                                let target_id = executed.target_id;
+                                let command = executed.command;
                                 let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
                                     println!(
                                         "Skipping DHT action: no known route for target_id={}",
@@ -1392,6 +1440,72 @@ async fn run_initiator(
                                 )
                                 .await
                                 .context("execute DHT action from mark_active result")?;
+                            }
+                        }
+                        Ok(StreamCommand::FindNode { target_id }) => {
+                            println!(
+                                "Received DHT FIND_NODE from responder (target_id={})",
+                                hex::encode(target_id.as_bytes())
+                            );
+
+                            let closest = dht.lookup(target_id);
+                            let message_id = next_dht_message_id;
+                            next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                            send_control_command(
+                                &socket,
+                                &mut transport,
+                                &mut out_buf,
+                                session_id,
+                                &mut tx_seq,
+                                &mut vwp_data_seq,
+                                control_stream_id,
+                                message_id,
+                                remote,
+                                StreamCommand::NodesFound { nodes: closest },
+                            )
+                            .await
+                            .context("send DHT NODES_FOUND")?;
+                        }
+                        Ok(StreamCommand::NodesFound { nodes }) => {
+                            println!(
+                                "Received DHT NODES_FOUND from responder (count={})",
+                                nodes.len()
+                            );
+
+                            let actions = dht.nodes_found_received(nodes);
+                            for action in actions {
+                                let Some(executed) = execute_dht_action(action, local_node_id)
+                                else {
+                                    continue;
+                                };
+                                let target_id = executed.target_id;
+                                let command = executed.command;
+                                let Some((target_stream_id, target_addr)) =
+                                    dht_routes.get(&target_id).copied()
+                                else {
+                                    println!(
+                                        "Skipping DHT action: no known route for target_id={}",
+                                        hex::encode(target_id.as_bytes())
+                                    );
+                                    continue;
+                                };
+
+                                let message_id = next_dht_message_id;
+                                next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    target_stream_id,
+                                    message_id,
+                                    target_addr,
+                                    command,
+                                )
+                                .await
+                                .context("execute DHT action from nodes_found result")?;
                             }
                         }
                         Err(err) => {

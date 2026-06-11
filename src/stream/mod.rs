@@ -13,7 +13,10 @@ pub const CMD_STREAM_START: u8 = 1;
 pub const CMD_STOP_STREAM: u8 = 2;
 pub const CMD_DHT_PING: u8 = 3;
 pub const CMD_DHT_PONG: u8 = 4;
+pub const CMD_DHT_FIND_NODE: u8 = 5;
+pub const CMD_DHT_NODES_FOUND: u8 = 6;
 pub const CMD_DHT_NODE_ID_LEN: usize = 1 + 32;
+pub const DHT_NODE_ID_BYTES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub enum StreamCommand {
@@ -21,6 +24,44 @@ pub enum StreamCommand {
     StopStream,
     Ping { sender_id: NodeId },
     Pong { sender_id: NodeId },
+    FindNode { target_id: NodeId },
+    NodesFound { nodes: Vec<NodeId> },
+}
+
+fn serialize_nodes(nodes: &[NodeId]) -> Vec<u8> {
+    let count = nodes.len().min(u8::MAX as usize);
+    let mut out = Vec::with_capacity(1 + count * DHT_NODE_ID_BYTES);
+    out.push(count as u8);
+    for node in nodes.iter().take(count) {
+        out.extend_from_slice(node.as_bytes());
+    }
+    out
+}
+
+fn deserialize_nodes(payload: &[u8]) -> Result<Vec<NodeId>> {
+    if payload.is_empty() {
+        bail!("NODES_FOUND payload missing length byte");
+    }
+
+    let count = payload[0] as usize;
+    let expected = 1 + count * DHT_NODE_ID_BYTES;
+    if payload.len() != expected {
+        bail!(
+            "invalid NODES_FOUND payload length: got {}, expected {}",
+            payload.len(),
+            expected
+        );
+    }
+
+    let mut nodes = Vec::with_capacity(count);
+    let mut offset = 1;
+    for _ in 0..count {
+        let mut id = [0u8; DHT_NODE_ID_BYTES];
+        id.copy_from_slice(&payload[offset..offset + DHT_NODE_ID_BYTES]);
+        nodes.push(NodeId::from_bytes(id));
+        offset += DHT_NODE_ID_BYTES;
+    }
+    Ok(nodes)
 }
 
 impl StreamCommand {
@@ -43,6 +84,18 @@ impl StreamCommand {
                 let mut payload = Vec::with_capacity(CMD_DHT_NODE_ID_LEN);
                 payload.push(CMD_DHT_PONG);
                 payload.extend_from_slice(sender_id.as_bytes());
+                payload
+            }
+            Self::FindNode { target_id } => {
+                let mut payload = Vec::with_capacity(CMD_DHT_NODE_ID_LEN);
+                payload.push(CMD_DHT_FIND_NODE);
+                payload.extend_from_slice(target_id.as_bytes());
+                payload
+            }
+            Self::NodesFound { nodes } => {
+                let mut payload = Vec::with_capacity(2 + nodes.len() * DHT_NODE_ID_BYTES);
+                payload.push(CMD_DHT_NODES_FOUND);
+                payload.extend_from_slice(&serialize_nodes(nodes));
                 payload
             }
         }
@@ -89,6 +142,20 @@ impl StreamCommand {
                 Ok(Self::Pong {
                     sender_id: NodeId::from_bytes(id),
                 })
+            }
+            CMD_DHT_FIND_NODE => {
+                if payload.len() != CMD_DHT_NODE_ID_LEN {
+                    bail!("invalid DHT_FIND_NODE payload length: {}", payload.len());
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&payload[1..CMD_DHT_NODE_ID_LEN]);
+                Ok(Self::FindNode {
+                    target_id: NodeId::from_bytes(id),
+                })
+            }
+            CMD_DHT_NODES_FOUND => {
+                let nodes = deserialize_nodes(&payload[1..])?;
+                Ok(Self::NodesFound { nodes })
             }
             other => bail!("unknown stream command: {other}"),
         }
@@ -181,7 +248,10 @@ impl StreamReceiver {
                 self.decoder = None;
                 Ok(StreamControlEvent::Stopped)
             }
-            StreamCommand::Ping { .. } | StreamCommand::Pong { .. } => Ok(StreamControlEvent::Ignored),
+            StreamCommand::Ping { .. }
+            | StreamCommand::Pong { .. }
+            | StreamCommand::FindNode { .. }
+            | StreamCommand::NodesFound { .. } => Ok(StreamControlEvent::Ignored),
         }
     }
 
@@ -563,5 +633,51 @@ mod tests {
             .on_control_payload(&pong)
             .expect("pong should decode");
         assert_eq!(event, StreamControlEvent::Ignored);
+
+        let find = StreamCommand::FindNode { target_id: sender }.encode();
+        let event = receiver
+            .on_control_payload(&find)
+            .expect("find should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
+
+        let nodes = StreamCommand::NodesFound {
+            nodes: vec![sender],
+        }
+        .encode();
+        let event = receiver
+            .on_control_payload(&nodes)
+            .expect("nodes_found should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
+    }
+
+    #[test]
+    fn find_node_and_nodes_found_roundtrip() {
+        let mut target = [0u8; 32];
+        target[0] = 0xAB;
+        let target = NodeId::from_bytes(target);
+
+        let find = StreamCommand::FindNode { target_id: target };
+        let find_raw = find.encode();
+        match StreamCommand::decode(&find_raw).expect("decode find") {
+            StreamCommand::FindNode { target_id } => assert_eq!(target_id, target),
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+
+        let n1 = NodeId::from_bytes([0x11; 32]);
+        let n2 = NodeId::from_bytes([0x22; 32]);
+        let found = StreamCommand::NodesFound {
+            nodes: vec![n1, n2],
+        };
+        let found_raw = found.encode();
+        match StreamCommand::decode(&found_raw).expect("decode nodes_found") {
+            StreamCommand::NodesFound { nodes } => assert_eq!(nodes, vec![n1, n2]),
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nodes_found_rejects_invalid_length() {
+        let malformed = vec![CMD_DHT_NODES_FOUND, 2, 0xAA];
+        assert!(StreamCommand::decode(&malformed).is_err());
     }
 }

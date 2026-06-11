@@ -2,11 +2,28 @@ use anyhow::{Context, Result};
 use snow::TransportState;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
-use velyx::{
+use crate::{
     PROTOCOL_VERSION, PacketType, VWP_STREAM_ID_LEN, WirePacket, chunk_control_message,
     dht::{NodeId, RoutingAction},
     stream::StreamCommand,
 };
+
+#[derive(Debug, Clone)]
+pub struct ExecutedDhtAction {
+    pub target_id: NodeId,
+    pub command: StreamCommand,
+}
+
+pub fn execute_dht_action(action: RoutingAction, local_id: NodeId) -> Option<ExecutedDhtAction> {
+    match action {
+        RoutingAction::Ping(target_id) => Some(ExecutedDhtAction {
+            target_id,
+            command: StreamCommand::Ping {
+                sender_id: local_id,
+            },
+        }),
+    }
+}
 
 pub fn route_action_to_command(action: RoutingAction, local_id: NodeId) -> (NodeId, StreamCommand) {
     match action {

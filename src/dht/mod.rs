@@ -308,6 +308,42 @@ impl RoutingTable {
             .copied()
             .collect()
     }
+
+    pub fn find_closest_nodes(&self, target: NodeId, limit: usize) -> Vec<NodeId> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut nodes = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.nodes.iter().copied())
+            .collect::<Vec<_>>();
+
+        nodes.sort_by(|a, b| {
+            let da = a.xor_distance(&target);
+            let db = b.xor_distance(&target);
+            da.cmp(&db).then_with(|| a.cmp(b))
+        });
+        nodes.truncate(limit);
+        nodes
+    }
+
+    pub fn lookup(&self, target: NodeId) -> Vec<NodeId> {
+        self.find_closest_nodes(target, self.k)
+    }
+
+    pub fn nodes_found_received<I>(&mut self, nodes: I) -> Vec<RoutingAction>
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        let mut actions = Vec::new();
+        for node in nodes {
+            let result = self.insert_with_actions(node);
+            actions.extend(result.actions);
+        }
+        actions
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +535,84 @@ mod tests {
                 new_candidate: c,
             }
         );
+    }
+
+    #[test]
+    fn find_closest_nodes_returns_sorted_by_xor_distance() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 20);
+
+        let mut n1 = [0u8; NODE_ID_LEN];
+        n1[31] = 0x01;
+        let n1 = NodeId::from_bytes(n1);
+
+        let mut n2 = [0u8; NODE_ID_LEN];
+        n2[31] = 0x02;
+        let n2 = NodeId::from_bytes(n2);
+
+        let mut n3 = [0u8; NODE_ID_LEN];
+        n3[31] = 0x04;
+        let n3 = NodeId::from_bytes(n3);
+
+        table.insert(n3);
+        table.insert(n1);
+        table.insert(n2);
+
+        let target = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let closest = table.find_closest_nodes(target, 3);
+        assert_eq!(closest, vec![n1, n2, n3]);
+    }
+
+    #[test]
+    fn find_closest_nodes_respects_limit_and_empty_cases() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 20);
+        let target = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+
+        assert!(table.find_closest_nodes(target, 5).is_empty());
+        assert!(table.find_closest_nodes(target, 0).is_empty());
+
+        let mut n1 = [0u8; NODE_ID_LEN];
+        n1[31] = 0x01;
+        let n1 = NodeId::from_bytes(n1);
+
+        let mut n2 = [0u8; NODE_ID_LEN];
+        n2[31] = 0x02;
+        let n2 = NodeId::from_bytes(n2);
+
+        let mut n3 = [0u8; NODE_ID_LEN];
+        n3[31] = 0x03;
+        let n3 = NodeId::from_bytes(n3);
+
+        table.insert(n1);
+        table.insert(n2);
+        table.insert(n3);
+
+        let limited = table.find_closest_nodes(target, 2);
+        assert_eq!(limited.len(), 2);
+
+        let via_lookup = table.lookup(target);
+        assert_eq!(via_lookup.len(), 3);
+    }
+
+    #[test]
+    fn nodes_found_received_collects_cascading_actions() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 1);
+
+        let mut a = [0u8; NODE_ID_LEN];
+        a[0] = 0x80;
+        a[31] = 1;
+        let a = NodeId::from_bytes(a);
+
+        let mut b = [0u8; NODE_ID_LEN];
+        b[0] = 0x80;
+        b[31] = 2;
+        let b = NodeId::from_bytes(b);
+
+        table.insert(a);
+        let actions = table.nodes_found_received(vec![b]);
+
+        assert_eq!(actions, vec![RoutingAction::Ping(a)]);
     }
 }
