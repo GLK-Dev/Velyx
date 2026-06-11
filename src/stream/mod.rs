@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use raptorq::{Decoder as RaptorDecoder, Encoder as RaptorEncoder, EncodingPacket, ObjectTransmissionInformation};
+use std::time::Duration;
 
 use crate::{VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message};
 
@@ -168,10 +169,20 @@ impl StreamReceiver {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum ChaosScope {
+    DataOnly,
+    AllFrames,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ChaosConfig {
     pub drop_data_pct: u8,
     pub drop_control_pct: u8,
     pub drop_ack_pct: u8,
+    pub duplicate_pct: u8,
+    pub reorder_pct: u8,
+    pub jitter_ms: u16,
+    pub scope: ChaosScope,
 }
 
 impl ChaosConfig {
@@ -180,6 +191,8 @@ impl ChaosConfig {
             ("drop_data_pct", self.drop_data_pct),
             ("drop_control_pct", self.drop_control_pct),
             ("drop_ack_pct", self.drop_ack_pct),
+            ("duplicate_pct", self.duplicate_pct),
+            ("reorder_pct", self.reorder_pct),
         ] {
             if value > 100 {
                 bail!("{label} must be <= 100, got {value}");
@@ -203,12 +216,60 @@ impl DirtyNetwork {
     }
 
     pub fn should_drop(&mut self, frame_type: VwpFrameType) -> bool {
+        if !self.is_in_scope(frame_type) {
+            return false;
+        }
+
         let pct = match frame_type {
             VwpFrameType::Data => self.config.drop_data_pct,
             VwpFrameType::Control => self.config.drop_control_pct,
             VwpFrameType::Ack => self.config.drop_ack_pct,
         };
 
+        if pct == 0 {
+            return false;
+        }
+
+        self.roll_pct(pct)
+    }
+
+    pub fn should_duplicate(&mut self, frame_type: VwpFrameType) -> bool {
+        if !self.is_in_scope(frame_type) || self.config.duplicate_pct == 0 {
+            return false;
+        }
+        self.roll_pct(self.config.duplicate_pct)
+    }
+
+    pub fn should_reorder(&mut self, frame_type: VwpFrameType) -> bool {
+        if !self.is_in_scope(frame_type) || self.config.reorder_pct == 0 {
+            return false;
+        }
+        self.roll_pct(self.config.reorder_pct)
+    }
+
+    pub fn jitter_delay(&mut self, frame_type: VwpFrameType) -> Option<Duration> {
+        if !self.is_in_scope(frame_type) || self.config.jitter_ms == 0 {
+            return None;
+        }
+
+        // Uniform delay in [0, jitter_ms].
+        let upper = self.config.jitter_ms as u32;
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        let sample = ((self.state >> 32) as u32) % (upper + 1);
+        Some(Duration::from_millis(sample as u64))
+    }
+
+    fn is_in_scope(&self, frame_type: VwpFrameType) -> bool {
+        match self.config.scope {
+            ChaosScope::DataOnly => frame_type == VwpFrameType::Data,
+            ChaosScope::AllFrames => true,
+        }
+    }
+
+    fn roll_pct(&mut self, pct: u8) -> bool {
         if pct == 0 {
             return false;
         }
@@ -240,6 +301,10 @@ mod tests {
                 drop_data_pct: 50,
                 drop_control_pct: 0,
                 drop_ack_pct: 0,
+                duplicate_pct: 0,
+                reorder_pct: 0,
+                jitter_ms: 0,
+                scope: ChaosScope::DataOnly,
             },
             42,
         )

@@ -13,7 +13,8 @@ use velyx::{
     chunk_control_message, negotiate, parse_server_and_validate,
 };
 use velyx::stream::{
-    ChaosConfig, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver, StreamSender,
+    ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
+    StreamSender,
 };
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -28,6 +29,7 @@ struct PeerSession {
     transport: Option<TransportState>,
     control_assembler: ControlAssembler,
     stream_receiver: StreamReceiver,
+    reorder_hold: Option<VwpFrame>,
 }
 
 #[tokio::main]
@@ -73,11 +75,12 @@ async fn main() -> Result<()> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  velyx responder <bind_addr> [--chaos-drop-data-pct <0-100>]");
+    println!("  velyx responder <bind_addr> [chaos flags]");
     println!("  velyx initiator <bind_addr> <remote_addr>");
     println!("Examples:");
     println!("  velyx responder 0.0.0.0:9000");
     println!("  velyx responder 0.0.0.0:9000 --chaos-drop-data-pct 30");
+    println!("  velyx responder 0.0.0.0:9000 --chaos-scope all --chaos-jitter-ms 20 --chaos-reorder-pct 10");
     println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000");
 }
 
@@ -85,20 +88,68 @@ fn parse_chaos_config(args: &[String]) -> Result<Option<ChaosConfig>> {
     if args.len() == 3 {
         return Ok(None);
     }
-    if args.len() != 5 || args[3] != "--chaos-drop-data-pct" {
-        print_usage();
-        bail!("invalid responder options");
-    }
 
-    let drop_data_pct: u8 = args[4]
-        .parse()
-        .with_context(|| format!("invalid chaos drop percentage: {}", args[4]))?;
-
-    Ok(Some(ChaosConfig {
-        drop_data_pct,
+    let mut cfg = ChaosConfig {
+        drop_data_pct: 0,
         drop_control_pct: 0,
         drop_ack_pct: 0,
-    }))
+        duplicate_pct: 0,
+        reorder_pct: 0,
+        jitter_ms: 0,
+        scope: ChaosScope::DataOnly,
+    };
+
+    let mut i = 3;
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            print_usage();
+            bail!("missing value for option: {}", args[i]);
+        }
+
+        match args[i].as_str() {
+            "--chaos-drop-data-pct" => {
+                cfg.drop_data_pct = parse_u8_opt("chaos-drop-data-pct", &args[i + 1])?;
+            }
+            "--chaos-drop-control-pct" => {
+                cfg.drop_control_pct = parse_u8_opt("chaos-drop-control-pct", &args[i + 1])?;
+            }
+            "--chaos-drop-ack-pct" => {
+                cfg.drop_ack_pct = parse_u8_opt("chaos-drop-ack-pct", &args[i + 1])?;
+            }
+            "--chaos-duplicate-pct" => {
+                cfg.duplicate_pct = parse_u8_opt("chaos-duplicate-pct", &args[i + 1])?;
+            }
+            "--chaos-reorder-pct" => {
+                cfg.reorder_pct = parse_u8_opt("chaos-reorder-pct", &args[i + 1])?;
+            }
+            "--chaos-jitter-ms" => {
+                cfg.jitter_ms = args[i + 1]
+                    .parse()
+                    .with_context(|| format!("invalid chaos-jitter-ms: {}", args[i + 1]))?;
+            }
+            "--chaos-scope" => {
+                cfg.scope = match args[i + 1].as_str() {
+                    "data" => ChaosScope::DataOnly,
+                    "all" => ChaosScope::AllFrames,
+                    other => bail!("invalid chaos scope: {other}; expected data|all"),
+                }
+            }
+            other => {
+                print_usage();
+                bail!("unknown responder option: {other}");
+            }
+        }
+
+        i += 2;
+    }
+
+    Ok(Some(cfg.validate()?))
+}
+
+fn parse_u8_opt(name: &str, value: &str) -> Result<u8> {
+    value
+        .parse()
+        .with_context(|| format!("invalid {name}: {value}"))
 }
 
 fn local_caps() -> CapabilitySet {
@@ -255,6 +306,54 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 }
             };
 
+            if let Some(chaos_network) = chaos.as_mut()
+                && chaos_network.should_drop(vwp.frame_type)
+            {
+                println!("[{remote}] Chaos middleware dropped incoming {:?} frame", vwp.frame_type);
+                continue;
+            }
+
+            let mut frames_to_process = Vec::new();
+            if let Some(chaos_network) = chaos.as_mut()
+                && chaos_network.should_reorder(vwp.frame_type)
+            {
+                if let Some(held) = session.reorder_hold.replace(vwp.clone()) {
+                    // Process current first and delayed packet second to simulate reordering.
+                    frames_to_process.push(vwp);
+                    frames_to_process.push(held);
+                } else {
+                    println!("[{remote}] Chaos middleware buffered frame for reordering");
+                    continue;
+                }
+            } else if let Some(held) = session.reorder_hold.take() {
+                // Flush delayed frame after current one to keep out-of-order behavior visible.
+                frames_to_process.push(vwp.clone());
+                frames_to_process.push(held);
+            } else {
+                frames_to_process.push(vwp);
+            }
+
+            if let Some(chaos_network) = chaos.as_mut() {
+                let mut duplicated = Vec::new();
+                for frame in &frames_to_process {
+                    if chaos_network.should_duplicate(frame.frame_type) {
+                        duplicated.push(frame.clone());
+                    }
+                }
+                if !duplicated.is_empty() {
+                    println!("[{remote}] Chaos middleware duplicated {} frame(s)", duplicated.len());
+                }
+                frames_to_process.extend(duplicated);
+            }
+
+            for vwp in frames_to_process {
+                if let Some(chaos_network) = chaos.as_mut()
+                    && let Some(delay) = chaos_network.jitter_delay(vwp.frame_type)
+                    && !delay.is_zero()
+                {
+                    tokio::time::sleep(delay).await;
+                }
+
             match vwp.frame_type {
                 VwpFrameType::Control => {
                     let chunk = match ControlChunk::decode(&vwp.payload) {
@@ -354,13 +453,6 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                     println!("[{remote}] Received ACK frame on responder side");
                 }
                 VwpFrameType::Data => {
-                    if let Some(chaos_network) = chaos.as_mut()
-                        && chaos_network.should_drop(VwpFrameType::Data)
-                    {
-                        println!("[{remote}] Chaos middleware dropped incoming Data frame");
-                        continue;
-                    }
-
                     match session.stream_receiver.ingest_data_packet(&vwp.payload) {
                         Ok(Some(decoded)) => {
                         println!(
@@ -465,6 +557,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                         }
                     }
                 }
+            }
             }
             continue;
         }
@@ -571,6 +664,7 @@ async fn run_responder(bind_addr: &str, mut chaos: Option<DirtyNetwork>) -> Resu
                 transport: None,
                 control_assembler: ControlAssembler::default(),
                 stream_receiver: StreamReceiver::default(),
+                reorder_hold: None,
             },
         );
 
