@@ -1,9 +1,13 @@
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"VLYX";
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 28;
 pub const REPLAY_WINDOW_SIZE: u64 = 128;
+pub const VWP_STREAM_ID_LEN: usize = 32;
+pub const VWP_MAX_PAYLOAD: usize = 1400;
+pub const VWP_HEADER_LEN: usize = 1 + 4 + VWP_STREAM_ID_LEN;
 
 pub const ERR_UNSUPPORTED_VERSION: u16 = 0x0001;
 pub const ERR_MALFORMED_PACKET: u16 = 0x0002;
@@ -121,6 +125,243 @@ impl WirePacket {
             seq,
             payload: buf[HEADER_LEN..].to_vec(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VwpFrameType {
+    Control = 1,
+    Data = 2,
+    Ack = 3,
+}
+
+impl TryFrom<u8> for VwpFrameType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Control),
+            2 => Ok(Self::Data),
+            3 => Ok(Self::Ack),
+            _ => bail!("unknown VWP frame type: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VwpFrame {
+    pub frame_type: VwpFrameType,
+    pub seq: u32,
+    pub stream_id: [u8; VWP_STREAM_ID_LEN],
+    pub payload: Vec<u8>,
+}
+
+impl VwpFrame {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.payload.len() > VWP_MAX_PAYLOAD {
+            bail!(
+                "VWP payload too large: {} > {}",
+                self.payload.len(),
+                VWP_MAX_PAYLOAD
+            );
+        }
+
+        let mut out = Vec::with_capacity(VWP_HEADER_LEN + self.payload.len());
+        out.push(self.frame_type as u8);
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.stream_id);
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() < VWP_HEADER_LEN {
+            bail!("VWP frame too short: {}", input.len());
+        }
+
+        let frame_type = VwpFrameType::try_from(input[0])?;
+        let seq = u32::from_be_bytes([input[1], input[2], input[3], input[4]]);
+
+        let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
+        stream_id.copy_from_slice(&input[5..5 + VWP_STREAM_ID_LEN]);
+        let payload = input[VWP_HEADER_LEN..].to_vec();
+
+        if payload.len() > VWP_MAX_PAYLOAD {
+            bail!(
+                "decoded VWP payload too large: {} > {}",
+                payload.len(),
+                VWP_MAX_PAYLOAD
+            );
+        }
+
+        Ok(Self {
+            frame_type,
+            seq,
+            stream_id,
+            payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlChunk {
+    pub message_id: u32,
+    pub chunk_index: u16,
+    pub total_chunks: u16,
+    pub payload: Vec<u8>,
+}
+
+impl ControlChunk {
+    pub const HEADER_LEN: usize = 8;
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.chunk_index >= self.total_chunks {
+            bail!(
+                "invalid control chunk index {} for total {}",
+                self.chunk_index,
+                self.total_chunks
+            );
+        }
+
+        let mut out = Vec::with_capacity(Self::HEADER_LEN + self.payload.len());
+        out.extend_from_slice(&self.message_id.to_be_bytes());
+        out.extend_from_slice(&self.chunk_index.to_be_bytes());
+        out.extend_from_slice(&self.total_chunks.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() < Self::HEADER_LEN {
+            bail!("control chunk too short: {}", input.len());
+        }
+
+        let message_id = u32::from_be_bytes([input[0], input[1], input[2], input[3]]);
+        let chunk_index = u16::from_be_bytes([input[4], input[5]]);
+        let total_chunks = u16::from_be_bytes([input[6], input[7]]);
+        if total_chunks == 0 {
+            bail!("invalid total_chunks=0");
+        }
+        if chunk_index >= total_chunks {
+            bail!(
+                "invalid chunk index {} for total {}",
+                chunk_index,
+                total_chunks
+            );
+        }
+
+        Ok(Self {
+            message_id,
+            chunk_index,
+            total_chunks,
+            payload: input[Self::HEADER_LEN..].to_vec(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlAck {
+    pub message_id: u32,
+    pub chunk_index: u16,
+}
+
+impl ControlAck {
+    pub const LEN: usize = 6;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.message_id.to_be_bytes());
+        out[4..6].copy_from_slice(&self.chunk_index.to_be_bytes());
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() != Self::LEN {
+            bail!("invalid control ack length: {}", input.len());
+        }
+        Ok(Self {
+            message_id: u32::from_be_bytes([input[0], input[1], input[2], input[3]]),
+            chunk_index: u16::from_be_bytes([input[4], input[5]]),
+        })
+    }
+}
+
+pub fn chunk_control_message(
+    stream_id: [u8; VWP_STREAM_ID_LEN],
+    message_id: u32,
+    start_seq: u32,
+    message: &[u8],
+) -> Result<Vec<VwpFrame>> {
+    let max_chunk_payload = VWP_MAX_PAYLOAD
+        .checked_sub(ControlChunk::HEADER_LEN)
+        .context("invalid VWP max payload")?;
+    if max_chunk_payload == 0 {
+        bail!("max control chunk payload is zero");
+    }
+
+    let total_chunks_usize = message.len().div_ceil(max_chunk_payload).max(1);
+    let total_chunks: u16 = total_chunks_usize
+        .try_into()
+        .context("control message too large (too many chunks)")?;
+
+    let mut frames = Vec::with_capacity(total_chunks_usize);
+    for i in 0..total_chunks_usize {
+        let start = i * max_chunk_payload;
+        let end = ((i + 1) * max_chunk_payload).min(message.len());
+        let chunk = ControlChunk {
+            message_id,
+            chunk_index: i as u16,
+            total_chunks,
+            payload: message[start..end].to_vec(),
+        };
+        frames.push(VwpFrame {
+            frame_type: VwpFrameType::Control,
+            seq: start_seq.wrapping_add(i as u32),
+            stream_id,
+            payload: chunk.encode()?,
+        });
+    }
+
+    Ok(frames)
+}
+
+#[derive(Debug, Default)]
+pub struct ControlAssembler {
+    in_flight: HashMap<u32, Vec<Option<Vec<u8>>>>,
+}
+
+impl ControlAssembler {
+    pub fn push_chunk(&mut self, chunk: ControlChunk) -> Result<Option<Vec<u8>>> {
+        let slots = self
+            .in_flight
+            .entry(chunk.message_id)
+            .or_insert_with(|| vec![None; chunk.total_chunks as usize]);
+
+        if slots.len() != chunk.total_chunks as usize {
+            bail!(
+                "control chunk total mismatch for message {}: existing {}, got {}",
+                chunk.message_id,
+                slots.len(),
+                chunk.total_chunks
+            );
+        }
+
+        slots[chunk.chunk_index as usize] = Some(chunk.payload);
+
+        if slots.iter().all(Option::is_some) {
+            let completed = self
+                .in_flight
+                .remove(&chunk.message_id)
+                .context("missing completed message after assembly")?;
+            let mut out = Vec::new();
+            for part in completed {
+                out.extend_from_slice(part.as_ref().context("assembler missing part")?);
+            }
+            return Ok(Some(out));
+        }
+
+        Ok(None)
     }
 }
 
@@ -501,5 +742,39 @@ mod tests {
         let encoded = err.encode().expect("encode error frame");
         let decoded = ErrorFrame::decode(&encoded).expect("decode error frame");
         assert_eq!(decoded, err);
+    }
+
+    #[test]
+    fn vwp_frame_roundtrip() {
+        let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
+        stream_id[0] = 1;
+        let frame = VwpFrame {
+            frame_type: VwpFrameType::Data,
+            seq: 77,
+            stream_id,
+            payload: b"hello-vwp".to_vec(),
+        };
+
+        let encoded = frame.encode().expect("encode vwp frame");
+        let decoded = VwpFrame::decode(&encoded).expect("decode vwp frame");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn control_chunk_and_assembly_roundtrip() {
+        let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
+        stream_id[1] = 2;
+        let payload = vec![42u8; 5000];
+        let frames = chunk_control_message(stream_id, 99, 0, &payload).expect("chunk message");
+        assert!(frames.len() > 1);
+
+        let mut assembler = ControlAssembler::default();
+        let mut assembled = None;
+        for frame in frames {
+            let chunk = ControlChunk::decode(&frame.payload).expect("decode chunk");
+            assembled = assembler.push_chunk(chunk).expect("push chunk").or(assembled);
+        }
+
+        assert_eq!(assembled.expect("assembled payload"), payload);
     }
 }

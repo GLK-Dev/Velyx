@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use velyx::{
-    CAP_OBFS_V1, CAP_RELAY_V1, CapabilitySet, ClientFinish, ClientHello, HEADER_LEN, Negotiated,
-    PROTOCOL_VERSION, PacketType, ReplayWindow, ServerHello, WirePacket, negotiate,
-    parse_server_and_validate,
+    CAP_OBFS_V1, CAP_RELAY_V1, CapabilitySet, ClientFinish, ClientHello, ControlAck,
+    ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
+    ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
+    chunk_control_message, negotiate, parse_server_and_validate,
 };
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -18,8 +19,10 @@ struct PeerSession {
     negotiated: Negotiated,
     recv_replay: ReplayWindow,
     tx_seq: u64,
+    vwp_tx_seq: u32,
     handshake: Option<HandshakeState>,
     transport: Option<TransportState>,
+    control_assembler: ControlAssembler,
 }
 
 #[tokio::main]
@@ -211,38 +214,134 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                     continue;
                 }
             };
-            let incoming = String::from_utf8_lossy(&out_buf[..msg_len]);
-            println!("[{remote}] Decrypted payload: {incoming}");
-
-            let reply = b"velyx-pong";
-            let enc_reply_len = match transport.write_message(reply, &mut out_buf) {
-                Ok(len) => len,
+            let vwp = match VwpFrame::decode(&out_buf[..msg_len]) {
+                Ok(frame) => frame,
                 Err(err) => {
-                    println!("Failed to encrypt response for {remote}: {err}");
+                    println!("Failed to decode VWP frame from {remote}: {err}");
                     continue;
                 }
             };
 
-            let reply_packet = WirePacket {
-                version: PROTOCOL_VERSION,
-                packet_type: PacketType::Data,
-                flags: 0,
-                session_id: session.session_id,
-                seq: session.tx_seq,
-                payload: out_buf[..enc_reply_len].to_vec(),
-            };
-            session.tx_seq += 1;
+            match vwp.frame_type {
+                VwpFrameType::Control => {
+                    let chunk = match ControlChunk::decode(&vwp.payload) {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            println!("Invalid control chunk from {remote}: {err}");
+                            continue;
+                        }
+                    };
 
-            let reply_raw = match reply_packet.encode() {
-                Ok(raw) => raw,
-                Err(err) => {
-                    println!("Failed to encode response for {remote}: {err}");
-                    continue;
+                    // ACK each control chunk for reliable metadata delivery.
+                    let ack = ControlAck {
+                        message_id: chunk.message_id,
+                        chunk_index: chunk.chunk_index,
+                    };
+                    let ack_frame = VwpFrame {
+                        frame_type: VwpFrameType::Ack,
+                        seq: session.vwp_tx_seq,
+                        stream_id: vwp.stream_id,
+                        payload: ack.encode().to_vec(),
+                    };
+                    session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
+
+                    let ack_wire_len = match ack_frame.encode() {
+                        Ok(bytes) => match transport.write_message(&bytes, &mut out_buf) {
+                            Ok(n) => n,
+                            Err(err) => {
+                                println!("Failed to encrypt control ACK for {remote}: {err}");
+                                continue;
+                            }
+                        },
+                        Err(err) => {
+                            println!("Failed to encode control ACK for {remote}: {err}");
+                            continue;
+                        }
+                    };
+                    let ack_packet = WirePacket {
+                        version: PROTOCOL_VERSION,
+                        packet_type: PacketType::Data,
+                        flags: 0,
+                        session_id: session.session_id,
+                        seq: session.tx_seq,
+                        payload: out_buf[..ack_wire_len].to_vec(),
+                    };
+                    session.tx_seq += 1;
+                    let ack_raw = match ack_packet.encode() {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            println!("Failed to encode ACK packet for {remote}: {err}");
+                            continue;
+                        }
+                    };
+                    if let Err(err) = socket.send_to(&ack_raw, remote).await {
+                        println!("Failed to send ACK packet to {remote}: {err}");
+                        continue;
+                    }
+
+                    let assembled = match session.control_assembler.push_chunk(chunk) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            println!("Control assembler error for {remote}: {err}");
+                            continue;
+                        }
+                    };
+
+                    if let Some(full) = assembled {
+                        let as_text = String::from_utf8_lossy(&full);
+                        println!("[{remote}] Assembled control payload ({} bytes)", full.len());
+                        println!("[{remote}] Control text: {as_text}");
+
+                        let data_frame = VwpFrame {
+                            frame_type: VwpFrameType::Data,
+                            seq: session.vwp_tx_seq,
+                            stream_id: vwp.stream_id,
+                            payload: b"velyx-pong".to_vec(),
+                        };
+                        session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
+
+                        let data_wire_len = match data_frame.encode() {
+                            Ok(bytes) => match transport.write_message(&bytes, &mut out_buf) {
+                                Ok(n) => n,
+                                Err(err) => {
+                                    println!("Failed to encrypt data reply for {remote}: {err}");
+                                    continue;
+                                }
+                            },
+                            Err(err) => {
+                                println!("Failed to encode VWP data reply for {remote}: {err}");
+                                continue;
+                            }
+                        };
+
+                        let reply_packet = WirePacket {
+                            version: PROTOCOL_VERSION,
+                            packet_type: PacketType::Data,
+                            flags: 0,
+                            session_id: session.session_id,
+                            seq: session.tx_seq,
+                            payload: out_buf[..data_wire_len].to_vec(),
+                        };
+                        session.tx_seq += 1;
+                        let reply_raw = match reply_packet.encode() {
+                            Ok(raw) => raw,
+                            Err(err) => {
+                                println!("Failed to encode data reply packet for {remote}: {err}");
+                                continue;
+                            }
+                        };
+                        if let Err(err) = socket.send_to(&reply_raw, remote).await {
+                            println!("Failed to send data reply to {remote}: {err}");
+                        }
+                    }
                 }
-            };
-
-            if let Err(err) = socket.send_to(&reply_raw, remote).await {
-                println!("Failed to send response to {remote}: {err}");
+                VwpFrameType::Ack => {
+                    println!("[{remote}] Received ACK frame on responder side");
+                }
+                VwpFrameType::Data => {
+                    let incoming = String::from_utf8_lossy(&vwp.payload);
+                    println!("[{remote}] Data frame payload: {incoming}");
+                }
             }
             continue;
         }
@@ -344,8 +443,10 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
                 negotiated: selected,
                 recv_replay,
                 tx_seq: 1,
+                vwp_tx_seq: 0,
                 handshake: Some(hs),
                 transport: None,
+                control_assembler: ControlAssembler::default(),
             },
         );
 
@@ -458,43 +559,81 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
         .into_transport_mode()
         .context("failed to switch to transport mode")?;
 
-    let payload = b"velyx-ping";
-    let enc_len = transport
-        .write_message(payload, &mut out_buf)
-        .context("failed to encrypt payload")?;
-    let data_pkt = WirePacket {
-        version: PROTOCOL_VERSION,
-        packet_type: PacketType::Data,
-        flags: 0,
-        session_id,
-        seq: tx_seq,
-        payload: out_buf[..enc_len].to_vec(),
-    };
-    let data_raw = data_pkt.encode()?;
-    socket
-        .send_to(&data_raw, remote)
-        .await
-        .context("failed to send encrypted payload")?;
+    let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
+    stream_id[0..8].copy_from_slice(&session_id.to_be_bytes());
 
-    let (resp_len, from3) = socket
-        .recv_from(&mut in_buf)
-        .await
-        .context("failed to receive encrypted response")?;
-    if from3 != remote {
-        bail!("response source mismatch: expected {remote}, got {from3}");
+    let control_payload = b"control: metadata handshake for swarm bootstrap over reliable chunks";
+    let control_frames = chunk_control_message(stream_id, 1, 0, control_payload)
+        .context("failed to chunk control payload")?;
+    let expected_acks = control_frames.len();
+
+    for control_frame in &control_frames {
+        let vwp_raw = control_frame.encode().context("encode VWP control frame")?;
+        let enc_len = transport
+            .write_message(&vwp_raw, &mut out_buf)
+            .context("failed to encrypt VWP control frame")?;
+        let data_pkt = WirePacket {
+            version: PROTOCOL_VERSION,
+            packet_type: PacketType::Data,
+            flags: 0,
+            session_id,
+            seq: tx_seq,
+            payload: out_buf[..enc_len].to_vec(),
+        };
+        tx_seq += 1;
+        let data_raw = data_pkt.encode()?;
+        socket
+            .send_to(&data_raw, remote)
+            .await
+            .context("failed to send control chunk")?;
     }
-    let response_pkt = decode_and_validate(
-        &in_buf[..resp_len],
-        PacketType::Data,
-        PROTOCOL_VERSION,
-        Some(session_id),
-        &mut recv_replay,
-    )?;
-    let plain_len = transport
-        .read_message(&response_pkt.payload, &mut out_buf)
-        .context("failed to decrypt response")?;
-    let response = String::from_utf8_lossy(&out_buf[..plain_len]);
-    println!("Decrypted response: {response}");
+
+    let mut acked_chunks = 0usize;
+    loop {
+        let (resp_len, from3) = socket
+            .recv_from(&mut in_buf)
+            .await
+            .context("failed to receive encrypted response")?;
+        if from3 != remote {
+            bail!("response source mismatch: expected {remote}, got {from3}");
+        }
+
+        let response_pkt = decode_and_validate(
+            &in_buf[..resp_len],
+            PacketType::Data,
+            PROTOCOL_VERSION,
+            Some(session_id),
+            &mut recv_replay,
+        )?;
+        let plain_len = transport
+            .read_message(&response_pkt.payload, &mut out_buf)
+            .context("failed to decrypt response")?;
+        let frame = VwpFrame::decode(&out_buf[..plain_len]).context("decode VWP response")?;
+
+        match frame.frame_type {
+            VwpFrameType::Ack => {
+                let ack = ControlAck::decode(&frame.payload).context("decode control ACK")?;
+                println!(
+                    "Received control ACK: message_id={}, chunk_index={}",
+                    ack.message_id, ack.chunk_index
+                );
+                acked_chunks += 1;
+                if acked_chunks == expected_acks {
+                    println!("All control chunks acknowledged ({acked_chunks}/{expected_acks})");
+                }
+            }
+            VwpFrameType::Data => {
+                let response = String::from_utf8_lossy(&frame.payload);
+                println!("Received VWP data response: {response}");
+                if acked_chunks >= expected_acks {
+                    break;
+                }
+            }
+            VwpFrameType::Control => {
+                println!("Received unexpected control frame from responder");
+            }
+        }
+    }
 
     Ok(())
 }
