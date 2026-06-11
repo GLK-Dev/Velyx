@@ -1,13 +1,15 @@
 use serde::Deserialize;
 use velyx::{
-    CAP_DHT_V1, CAP_FEC_V1, CAP_OBFS_V1, CapabilitySet, ClientFinish, ClientHello, PacketType,
-    ServerHello, WirePacket, negotiate, parse_server_and_validate,
+    AckFrame, CAP_DHT_V1, CAP_FEC_V1, CAP_OBFS_V1, CapabilitySet, ClientFinish, ClientHello,
+    ERR_REPLAY_DETECTED, ErrorFrame, PacketType, ServerHello, WirePacket, negotiate,
+    parse_server_and_validate,
 };
 
 #[derive(Debug, Deserialize)]
 struct WireVectors {
     wire_packets: Vec<WirePacketVector>,
     capability_vectors: CapabilityVectors,
+    control_vectors: ControlVectors,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +29,12 @@ struct CapabilityVectors {
     client_hello_hex: String,
     server_hello_hex: String,
     client_finish_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlVectors {
+    ack_hex: String,
+    error_hex: String,
 }
 
 #[test]
@@ -119,4 +127,39 @@ fn negotiation_interop_path() {
 
     let decoded = WirePacket::decode(&packet.encode().expect("encode")).expect("decode");
     assert_eq!(decoded.payload, b"interop");
+}
+
+#[test]
+fn control_vectors_are_stable() {
+    let raw = std::fs::read_to_string("test_vectors/wire_vectors.json").expect("read vectors");
+    let vectors: WireVectors = serde_json::from_str(&raw).expect("parse vectors");
+
+    let ack = AckFrame {
+        acked_seq: 100,
+        ack_bits: 0b1001,
+    };
+    assert_eq!(hex::encode(ack.encode()), vectors.control_vectors.ack_hex);
+
+    let err = ErrorFrame {
+        code: ERR_REPLAY_DETECTED,
+        detail: "replay".to_string(),
+    };
+    assert_eq!(
+        hex::encode(err.encode().expect("encode error")),
+        vectors.control_vectors.error_hex
+    );
+
+    let decoded_ack = AckFrame::decode(&hex::decode(&vectors.control_vectors.ack_hex).expect("ack hex"))
+        .expect("decode ack");
+    assert!(decoded_ack.acknowledges(100));
+    assert!(decoded_ack.acknowledges(99));
+    assert!(decoded_ack.acknowledges(96));
+    assert!(!decoded_ack.acknowledges(98));
+
+    let decoded_error = ErrorFrame::decode(
+        &hex::decode(&vectors.control_vectors.error_hex).expect("error hex"),
+    )
+    .expect("decode error");
+    assert_eq!(decoded_error.code, ERR_REPLAY_DETECTED);
+    assert_eq!(decoded_error.detail, "replay");
 }

@@ -21,6 +21,22 @@ If you want a protocol that is not just a codebase but a future standard, this i
 1. VEP-001: Wire format and capability negotiation.
 2. VEP-002: Capability bit registry.
 3. VEP-003: Error codes and ACK semantics.
+4. VEP-004: Session state machine and lifecycle semantics.
+
+## Session Lifecycle
+```mermaid
+stateDiagram-v2
+	[*] --> Idle
+	Idle --> WaitHs1: responder start
+	Idle --> WaitHs2: initiator send HS1
+	WaitHs1 --> WaitHs3: recv HS1 + send HS2
+	WaitHs2 --> Secure: recv HS2 + send HS3
+	WaitHs3 --> Secure: recv HS3
+	Secure --> Secure: DATA/ACK/CONTROL
+	Secure --> Closing: fatal error or close
+	Closing --> Closed: timeout or close ack
+	Closed --> [*]
+```
 
 ## Repository Layout
 1. src/main.rs: MVP node (initiator/responder) runtime.

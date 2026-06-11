@@ -5,6 +5,21 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 28;
 pub const REPLAY_WINDOW_SIZE: u64 = 128;
 
+pub const ERR_UNSUPPORTED_VERSION: u16 = 0x0001;
+pub const ERR_MALFORMED_PACKET: u16 = 0x0002;
+pub const ERR_UNEXPECTED_PACKET_TYPE: u16 = 0x0003;
+pub const ERR_INVALID_SESSION: u16 = 0x0004;
+pub const ERR_REPLAY_DETECTED: u16 = 0x0005;
+pub const ERR_CAPABILITY_MISMATCH: u16 = 0x0006;
+
+pub const ERR_HANDSHAKE_FAILED: u16 = 0x0101;
+pub const ERR_NO_SHARED_VERSION: u16 = 0x0102;
+pub const ERR_NEGOTIATION_ECHO_MISMATCH: u16 = 0x0103;
+
+pub const ERR_RATE_LIMITED: u16 = 0x0201;
+pub const ERR_INTERNAL: u16 = 0x0202;
+pub const ERR_BUSY_RETRY: u16 = 0x0203;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
@@ -106,6 +121,100 @@ impl WirePacket {
             seq,
             payload: buf[HEADER_LEN..].to_vec(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckFrame {
+    pub acked_seq: u64,
+    pub ack_bits: u64,
+}
+
+impl AckFrame {
+    pub const LEN: usize = 16;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..8].copy_from_slice(&self.acked_seq.to_be_bytes());
+        out[8..16].copy_from_slice(&self.ack_bits.to_be_bytes());
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() != Self::LEN {
+            bail!("invalid ack frame length: {}", input.len());
+        }
+
+        let mut acked_seq = [0u8; 8];
+        acked_seq.copy_from_slice(&input[0..8]);
+        let mut ack_bits = [0u8; 8];
+        ack_bits.copy_from_slice(&input[8..16]);
+
+        Ok(Self {
+            acked_seq: u64::from_be_bytes(acked_seq),
+            ack_bits: u64::from_be_bytes(ack_bits),
+        })
+    }
+
+    pub fn acknowledges(&self, seq: u64) -> bool {
+        if seq == self.acked_seq {
+            return true;
+        }
+        if seq > self.acked_seq {
+            return false;
+        }
+
+        let delta = self.acked_seq - seq;
+        if delta == 0 || delta > 64 {
+            return false;
+        }
+
+        let bit_index = delta - 1;
+        (self.ack_bits & (1u64 << bit_index)) != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorFrame {
+    pub code: u16,
+    pub detail: String,
+}
+
+impl ErrorFrame {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let detail_bytes = self.detail.as_bytes();
+        let detail_len: u16 = detail_bytes
+            .len()
+            .try_into()
+            .context("error detail too long")?;
+
+        let mut out = Vec::with_capacity(4 + detail_bytes.len());
+        out.extend_from_slice(&self.code.to_be_bytes());
+        out.extend_from_slice(&detail_len.to_be_bytes());
+        out.extend_from_slice(detail_bytes);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() < 4 {
+            bail!("invalid error frame length: {}", input.len());
+        }
+
+        let code = u16::from_be_bytes([input[0], input[1]]);
+        let detail_len = u16::from_be_bytes([input[2], input[3]]) as usize;
+        if input.len() != 4 + detail_len {
+            bail!(
+                "invalid error detail length: declared {}, actual {}",
+                detail_len,
+                input.len().saturating_sub(4)
+            );
+        }
+
+        let detail = std::str::from_utf8(&input[4..])
+            .context("error detail is not valid UTF-8")?
+            .to_owned();
+
+        Ok(Self { code, detail })
     }
 }
 
@@ -364,5 +473,33 @@ mod tests {
         let encoded = p.encode().expect("encode packet");
         let decoded = WirePacket::decode(&encoded).expect("decode packet");
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn ack_frame_roundtrip_and_lookup() {
+        let ack = AckFrame {
+            acked_seq: 100,
+            ack_bits: 0b1001,
+        };
+
+        let encoded = ack.encode();
+        let decoded = AckFrame::decode(&encoded).expect("decode ack frame");
+        assert_eq!(decoded, ack);
+        assert!(decoded.acknowledges(100));
+        assert!(decoded.acknowledges(99));
+        assert!(decoded.acknowledges(96));
+        assert!(!decoded.acknowledges(98));
+    }
+
+    #[test]
+    fn error_frame_roundtrip() {
+        let err = ErrorFrame {
+            code: ERR_REPLAY_DETECTED,
+            detail: "replay".to_string(),
+        };
+
+        let encoded = err.encode().expect("encode error frame");
+        let decoded = ErrorFrame::decode(&encoded).expect("decode error frame");
+        assert_eq!(decoded, err);
     }
 }

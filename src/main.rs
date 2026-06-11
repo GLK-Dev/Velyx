@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
-use snow::{Builder, params::NoiseParams};
+use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use velyx::{
@@ -11,6 +12,15 @@ use velyx::{
 };
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+
+struct PeerSession {
+    session_id: u64,
+    negotiated: Negotiated,
+    recv_replay: ReplayWindow,
+    tx_seq: u64,
+    handshake: Option<HandshakeState>,
+    transport: Option<TransportState>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,141 +88,270 @@ async fn run_responder(bind_addr: &str) -> Result<()> {
         .with_context(|| format!("failed to bind responder socket on {bind_addr}"))?;
     println!("Responder listening on {bind_addr}");
 
-    let params: NoiseParams = NOISE_PATTERN
-        .parse()
-        .context("failed to parse noise pattern")?;
     let static_key = noise_private_key()?;
-
-    let mut hs = Builder::new(params)
-        .local_private_key(&static_key)
-        .build_responder()
-        .context("failed to build responder state")?;
-
+    let local = local_caps();
+    let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
-    let mut recv_replay = ReplayWindow::default();
-    let mut tx_seq = 0u64;
 
-    let local = local_caps();
+    loop {
+        let (len, remote) = socket
+            .recv_from(&mut in_buf)
+            .await
+            .context("failed to receive UDP datagram")?;
 
-    let (len1, remote) = socket
-        .recv_from(&mut in_buf)
-        .await
-        .context("failed to receive handshake message 1")?;
-    let pkt1 = decode_and_validate(
-        &in_buf[..len1],
-        PacketType::Handshake1,
-        PROTOCOL_VERSION,
-        None,
-        &mut recv_replay,
-    )?;
-    let hello_len = hs
-        .read_message(&pkt1.payload, &mut out_buf)
-        .context("failed to parse handshake message 1")?;
-    let remote_hello = ClientHello::decode(&out_buf[..hello_len])
-        .context("invalid client hello in handshake message 1")?;
-    let selected = negotiate(local, remote_hello)?;
+        let packet = match WirePacket::decode(&in_buf[..len]) {
+            Ok(packet) => packet,
+            Err(err) => {
+                println!("Dropping invalid packet from {remote}: {err}");
+                continue;
+            }
+        };
 
-    println!("Handshake msg1 received from {remote}");
+        if packet.version != PROTOCOL_VERSION {
+            println!(
+                "Dropping packet from {remote}: unsupported version {}",
+                packet.version
+            );
+            continue;
+        }
 
-    let hello2 = ServerHello {
-        min_version: local.min_version,
-        max_version: local.max_version,
-        caps: local.mask,
-        selected_version: selected.version,
-        selected_caps: selected.caps,
-    };
+        if let Some(session) = peers.get_mut(&remote) {
+            if packet.session_id != session.session_id {
+                println!(
+                    "Dropping packet from {remote}: session mismatch got {}, expected {}",
+                    packet.session_id, session.session_id
+                );
+                continue;
+            }
 
-    let len2 = hs
-        .write_message(&hello2.encode(), &mut out_buf)
-        .context("failed to write handshake message 2")?;
-    let wire2 = WirePacket {
-        version: PROTOCOL_VERSION,
-        packet_type: PacketType::Handshake2,
-        flags: 0,
-        session_id: pkt1.session_id,
-        seq: tx_seq,
-        payload: out_buf[..len2].to_vec(),
-    };
-    tx_seq += 1;
-    let raw2 = wire2.encode()?;
-    socket
-        .send_to(&raw2, remote)
-        .await
-        .context("failed to send handshake message 2")?;
+            if let Err(err) = session.recv_replay.check_and_record(packet.seq) {
+                println!("Dropping replay/out-of-window packet from {remote}: {err}");
+                continue;
+            }
 
-    let (len3, remote2) = socket
-        .recv_from(&mut in_buf)
-        .await
-        .context("failed to receive handshake message 3")?;
-    if remote2 != remote {
-        bail!("handshake source mismatch: expected {remote}, got {remote2}");
+            if let Some(hs) = session.handshake.as_mut() {
+                if packet.packet_type != PacketType::Handshake3 {
+                    println!(
+                        "Dropping unexpected packet from {remote} during handshake: {:?}",
+                        packet.packet_type
+                    );
+                    continue;
+                }
+
+                let finish_len = match hs.read_message(&packet.payload, &mut out_buf) {
+                    Ok(len) => len,
+                    Err(err) => {
+                        println!("Failed handshake message 3 from {remote}: {err}");
+                        peers.remove(&remote);
+                        continue;
+                    }
+                };
+
+                let finish = match ClientFinish::decode(&out_buf[..finish_len]) {
+                    Ok(finish) => finish,
+                    Err(err) => {
+                        println!("Invalid client finish payload from {remote}: {err}");
+                        peers.remove(&remote);
+                        continue;
+                    }
+                };
+
+                if let Err(err) = validate_finish(finish, session.negotiated) {
+                    println!("Negotiation validation failed for {remote}: {err}");
+                    peers.remove(&remote);
+                    continue;
+                }
+
+                let hs_owned = match session.handshake.take() {
+                    Some(state) => state,
+                    None => {
+                        println!("Internal state error: missing handshake for {remote}");
+                        peers.remove(&remote);
+                        continue;
+                    }
+                };
+
+                let transport = match hs_owned.into_transport_mode() {
+                    Ok(mode) => mode,
+                    Err(err) => {
+                        println!("Failed to switch to transport mode for {remote}: {err}");
+                        peers.remove(&remote);
+                        continue;
+                    }
+                };
+                session.transport = Some(transport);
+
+                println!("Secure channel established with {remote}");
+                println!(
+                    "Negotiated version={} caps=0x{:016x}",
+                    session.negotiated.version, session.negotiated.caps
+                );
+                continue;
+            }
+
+            let Some(transport) = session.transport.as_mut() else {
+                println!("Internal state error: no handshake/transport for {remote}");
+                peers.remove(&remote);
+                continue;
+            };
+
+            if packet.packet_type != PacketType::Data {
+                println!(
+                    "Dropping unexpected secure packet from {remote}: {:?}",
+                    packet.packet_type
+                );
+                continue;
+            }
+
+            let msg_len = match transport.read_message(&packet.payload, &mut out_buf) {
+                Ok(len) => len,
+                Err(err) => {
+                    println!("Failed to decrypt payload from {remote}: {err}");
+                    continue;
+                }
+            };
+            let incoming = String::from_utf8_lossy(&out_buf[..msg_len]);
+            println!("[{remote}] Decrypted payload: {incoming}");
+
+            let reply = b"velyx-pong";
+            let enc_reply_len = match transport.write_message(reply, &mut out_buf) {
+                Ok(len) => len,
+                Err(err) => {
+                    println!("Failed to encrypt response for {remote}: {err}");
+                    continue;
+                }
+            };
+
+            let reply_packet = WirePacket {
+                version: PROTOCOL_VERSION,
+                packet_type: PacketType::Data,
+                flags: 0,
+                session_id: session.session_id,
+                seq: session.tx_seq,
+                payload: out_buf[..enc_reply_len].to_vec(),
+            };
+            session.tx_seq += 1;
+
+            let reply_raw = match reply_packet.encode() {
+                Ok(raw) => raw,
+                Err(err) => {
+                    println!("Failed to encode response for {remote}: {err}");
+                    continue;
+                }
+            };
+
+            if let Err(err) = socket.send_to(&reply_raw, remote).await {
+                println!("Failed to send response to {remote}: {err}");
+            }
+            continue;
+        }
+
+        if packet.packet_type != PacketType::Handshake1 {
+            println!(
+                "Dropping packet from unknown peer {remote}: expected Handshake1, got {:?}",
+                packet.packet_type
+            );
+            continue;
+        }
+
+        let params: NoiseParams = match NOISE_PATTERN.parse() {
+            Ok(params) => params,
+            Err(err) => {
+                println!("Failed to parse noise pattern for new peer {remote}: {err}");
+                continue;
+            }
+        };
+
+        let mut hs = match Builder::new(params)
+            .local_private_key(&static_key)
+            .build_responder()
+        {
+            Ok(state) => state,
+            Err(err) => {
+                println!("Failed to build responder state for {remote}: {err}");
+                continue;
+            }
+        };
+
+        let mut recv_replay = ReplayWindow::default();
+        if let Err(err) = recv_replay.check_and_record(packet.seq) {
+            println!("Invalid initial sequence from {remote}: {err}");
+            continue;
+        }
+
+        let hello_len = match hs.read_message(&packet.payload, &mut out_buf) {
+            Ok(len) => len,
+            Err(err) => {
+                println!("Failed handshake message 1 from {remote}: {err}");
+                continue;
+            }
+        };
+        let remote_hello = match ClientHello::decode(&out_buf[..hello_len]) {
+            Ok(hello) => hello,
+            Err(err) => {
+                println!("Invalid client hello in message 1 from {remote}: {err}");
+                continue;
+            }
+        };
+        let selected = match negotiate(local, remote_hello) {
+            Ok(negotiated) => negotiated,
+            Err(err) => {
+                println!("Negotiation failed for {remote}: {err}");
+                continue;
+            }
+        };
+
+        let hello2 = ServerHello {
+            min_version: local.min_version,
+            max_version: local.max_version,
+            caps: local.mask,
+            selected_version: selected.version,
+            selected_caps: selected.caps,
+        };
+
+        let len2 = match hs.write_message(&hello2.encode(), &mut out_buf) {
+            Ok(len) => len,
+            Err(err) => {
+                println!("Failed to write handshake message 2 for {remote}: {err}");
+                continue;
+            }
+        };
+        let hs2_packet = WirePacket {
+            version: PROTOCOL_VERSION,
+            packet_type: PacketType::Handshake2,
+            flags: 0,
+            session_id: packet.session_id,
+            seq: 0,
+            payload: out_buf[..len2].to_vec(),
+        };
+        let hs2_raw = match hs2_packet.encode() {
+            Ok(raw) => raw,
+            Err(err) => {
+                println!("Failed to encode handshake message 2 for {remote}: {err}");
+                continue;
+            }
+        };
+        if let Err(err) = socket.send_to(&hs2_raw, remote).await {
+            println!("Failed to send handshake message 2 to {remote}: {err}");
+            continue;
+        }
+
+        peers.insert(
+            remote,
+            PeerSession {
+                session_id: packet.session_id,
+                negotiated: selected,
+                recv_replay,
+                tx_seq: 1,
+                handshake: Some(hs),
+                transport: None,
+            },
+        );
+
+        println!("Handshake msg1 received from {remote}");
+        println!("Active peer sessions: {}", peers.len());
     }
-    let pkt3 = decode_and_validate(
-        &in_buf[..len3],
-        PacketType::Handshake3,
-        PROTOCOL_VERSION,
-        Some(pkt1.session_id),
-        &mut recv_replay,
-    )?;
-    let finish_len = hs
-        .read_message(&pkt3.payload, &mut out_buf)
-        .context("failed to parse handshake message 3")?;
-    let finish = ClientFinish::decode(&out_buf[..finish_len])
-        .context("invalid client finish payload")?;
-    validate_finish(finish, selected)?;
-    println!("Secure channel established with {remote}");
-    println!(
-        "Negotiated version={} caps=0x{:016x}",
-        selected.version, selected.caps
-    );
-
-    let mut transport = hs
-        .into_transport_mode()
-        .context("failed to switch to transport mode")?;
-
-    let (enc_len, remote3) = socket
-        .recv_from(&mut in_buf)
-        .await
-        .context("failed to receive encrypted payload")?;
-    if remote3 != remote {
-        bail!("payload source mismatch: expected {remote}, got {remote3}");
-    }
-
-    let data_packet = decode_and_validate(
-        &in_buf[..enc_len],
-        PacketType::Data,
-        PROTOCOL_VERSION,
-        Some(pkt1.session_id),
-        &mut recv_replay,
-    )?;
-
-    let msg_len = transport
-        .read_message(&data_packet.payload, &mut out_buf)
-        .context("failed to decrypt payload")?;
-    let incoming = String::from_utf8_lossy(&out_buf[..msg_len]);
-    println!("Decrypted payload: {incoming}");
-
-    let reply = b"velyx-pong";
-    let enc_reply_len = transport
-        .write_message(reply, &mut out_buf)
-        .context("failed to encrypt response")?;
-    let reply_packet = WirePacket {
-        version: PROTOCOL_VERSION,
-        packet_type: PacketType::Data,
-        flags: 0,
-        session_id: pkt1.session_id,
-        seq: tx_seq,
-        payload: out_buf[..enc_reply_len].to_vec(),
-    };
-    let reply_raw = reply_packet.encode()?;
-    socket
-        .send_to(&reply_raw, remote)
-        .await
-        .context("failed to send encrypted response")?;
-
-    println!("Encrypted response sent");
-    Ok(())
 }
 
 async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
