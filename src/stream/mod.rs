@@ -5,15 +5,22 @@ use std::io::Write;
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message};
+use crate::{
+    VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, chunk_control_message, dht::NodeId,
+};
 
 pub const CMD_STREAM_START: u8 = 1;
 pub const CMD_STOP_STREAM: u8 = 2;
+pub const CMD_DHT_PING: u8 = 3;
+pub const CMD_DHT_PONG: u8 = 4;
+pub const CMD_DHT_NODE_ID_LEN: usize = 1 + 32;
 
 #[derive(Debug, Clone)]
 pub enum StreamCommand {
     StreamStart(ObjectTransmissionInformation),
     StopStream,
+    Ping { sender_id: NodeId },
+    Pong { sender_id: NodeId },
 }
 
 impl StreamCommand {
@@ -26,6 +33,18 @@ impl StreamCommand {
                 payload
             }
             Self::StopStream => vec![CMD_STOP_STREAM],
+            Self::Ping { sender_id } => {
+                let mut payload = Vec::with_capacity(CMD_DHT_NODE_ID_LEN);
+                payload.push(CMD_DHT_PING);
+                payload.extend_from_slice(sender_id.as_bytes());
+                payload
+            }
+            Self::Pong { sender_id } => {
+                let mut payload = Vec::with_capacity(CMD_DHT_NODE_ID_LEN);
+                payload.push(CMD_DHT_PONG);
+                payload.extend_from_slice(sender_id.as_bytes());
+                payload
+            }
         }
     }
 
@@ -50,6 +69,26 @@ impl StreamCommand {
                     bail!("invalid STOP_STREAM payload length: {}", payload.len());
                 }
                 Ok(Self::StopStream)
+            }
+            CMD_DHT_PING => {
+                if payload.len() != CMD_DHT_NODE_ID_LEN {
+                    bail!("invalid DHT_PING payload length: {}", payload.len());
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&payload[1..CMD_DHT_NODE_ID_LEN]);
+                Ok(Self::Ping {
+                    sender_id: NodeId::from_bytes(id),
+                })
+            }
+            CMD_DHT_PONG => {
+                if payload.len() != CMD_DHT_NODE_ID_LEN {
+                    bail!("invalid DHT_PONG payload length: {}", payload.len());
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&payload[1..CMD_DHT_NODE_ID_LEN]);
+                Ok(Self::Pong {
+                    sender_id: NodeId::from_bytes(id),
+                })
             }
             other => bail!("unknown stream command: {other}"),
         }
@@ -142,6 +181,7 @@ impl StreamReceiver {
                 self.decoder = None;
                 Ok(StreamControlEvent::Stopped)
             }
+            StreamCommand::Ping { .. } | StreamCommand::Pong { .. } => Ok(StreamControlEvent::Ignored),
         }
     }
 
@@ -486,5 +526,42 @@ mod tests {
         assert!(frames.iter().all(|f| f.frame_type == VwpFrameType::Control));
         let chunk = ControlChunk::decode(&frames[0].payload).expect("chunk");
         assert_eq!(chunk.message_id, 1);
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        let sender = NodeId::from_bytes([0x11; 32]);
+
+        let ping = StreamCommand::Ping { sender_id: sender };
+        let ping_raw = ping.encode();
+        match StreamCommand::decode(&ping_raw).expect("decode ping") {
+            StreamCommand::Ping { sender_id } => assert_eq!(sender_id, sender),
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+
+        let pong = StreamCommand::Pong { sender_id: sender };
+        let pong_raw = pong.encode();
+        match StreamCommand::decode(&pong_raw).expect("decode pong") {
+            StreamCommand::Pong { sender_id } => assert_eq!(sender_id, sender),
+            other => panic!("unexpected decoded command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_receiver_ignores_dht_commands() {
+        let mut receiver = StreamReceiver::default();
+        let sender = NodeId::from_bytes([0x22; 32]);
+
+        let ping = StreamCommand::Ping { sender_id: sender }.encode();
+        let event = receiver
+            .on_control_payload(&ping)
+            .expect("ping should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
+
+        let pong = StreamCommand::Pong { sender_id: sender }.encode();
+        let event = receiver
+            .on_control_payload(&pong)
+            .expect("pong should decode");
+        assert_eq!(event, StreamControlEvent::Ignored);
     }
 }

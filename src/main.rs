@@ -1166,6 +1166,18 @@ async fn run_initiator(
                         Ok(StreamCommand::StreamStart(_)) => {
                             println!("Received unexpected STREAM_START from responder");
                         }
+                        Ok(StreamCommand::Ping { sender_id }) => {
+                            println!(
+                                "Received DHT PING from responder (sender_id={})",
+                                hex::encode(sender_id.as_bytes())
+                            );
+                        }
+                        Ok(StreamCommand::Pong { sender_id }) => {
+                            println!(
+                                "Received DHT PONG from responder (sender_id={})",
+                                hex::encode(sender_id.as_bytes())
+                            );
+                        }
                         Err(err) => {
                             println!("Failed to decode responder control command: {err}");
                         }
