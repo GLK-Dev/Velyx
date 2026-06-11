@@ -4,6 +4,19 @@ use std::time::{Duration, Instant};
 pub const NODE_ID_LEN: usize = 32;
 pub const K_BUCKET_COUNT: usize = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    Active,
+    Suspected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contact {
+    pub node_id: NodeId,
+    pub last_seen: Instant,
+    pub status: NodeStatus,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DhtMetrics {
     pub insert_inserted: u64,
@@ -20,6 +33,8 @@ pub struct DhtMetrics {
     pub refresh_marked: u64,
     pub actions_generated_ping: u64,
     pub actions_generated_lookup: u64,
+    pub nodes_suspected: u64,
+    pub nodes_evicted: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -139,8 +154,8 @@ pub struct RoutingResult<T> {
 
 #[derive(Debug, Clone)]
 struct Bucket {
-    nodes: VecDeque<NodeId>,
-    replacements: VecDeque<NodeId>,
+    nodes: VecDeque<Contact>,
+    replacements: VecDeque<Contact>,
     pending: Option<PendingReplacement>,
     last_refreshed: Instant,
 }
@@ -160,7 +175,18 @@ impl Bucket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingReplacement {
     stale_node: NodeId,
-    new_candidate: NodeId,
+    new_candidate: Contact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingFailureOutcome {
+    NotFound,
+    Suspected { bucket_index: u8, node_id: NodeId },
+    Evicted {
+        bucket_index: u8,
+        node_id: NodeId,
+        replaced_with: Option<NodeId>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -210,13 +236,22 @@ impl RoutingTable {
         };
 
         let now = Instant::now();
+        let candidate = Contact {
+            node_id,
+            last_seen: now,
+            status: NodeStatus::Active,
+        };
         let bucket = &mut self.buckets[bucket_index as usize];
-        if let Some(pos) = bucket.nodes.iter().position(|n| *n == node_id) {
+        if let Some(pos) = bucket.nodes.iter().position(|n| n.node_id == node_id) {
             let existing = bucket
                 .nodes
                 .remove(pos)
                 .expect("node index from position must exist");
-            bucket.nodes.push_back(existing);
+            bucket.nodes.push_back(Contact {
+                node_id: existing.node_id,
+                last_seen: now,
+                status: NodeStatus::Active,
+            });
             bucket.last_refreshed = now;
             self.metrics.insert_already_present += 1;
             return RoutingResult {
@@ -226,20 +261,21 @@ impl RoutingTable {
         }
 
         if bucket.nodes.len() >= self.k {
-            if !bucket.replacements.contains(&node_id) {
+            if !bucket.replacements.iter().any(|c| c.node_id == node_id) {
                 if bucket.replacements.len() >= self.k {
                     bucket.replacements.pop_front();
                 }
-                bucket.replacements.push_back(node_id);
+                bucket.replacements.push_back(candidate);
             }
 
-            let stale_node = *bucket
+            let stale_node = bucket
                 .nodes
                 .front()
-                .expect("full bucket must have oldest entry");
+                .expect("full bucket must have oldest entry")
+                .node_id;
             bucket.pending = Some(PendingReplacement {
                 stale_node,
-                new_candidate: node_id,
+                new_candidate: candidate,
             });
 
             self.metrics.insert_pending_ping += 1;
@@ -255,7 +291,7 @@ impl RoutingTable {
             };
         }
 
-        bucket.nodes.push_back(node_id);
+        bucket.nodes.push_back(candidate);
         bucket.last_refreshed = now;
         self.metrics.insert_inserted += 1;
         RoutingResult {
@@ -279,7 +315,7 @@ impl RoutingTable {
 
         let now = Instant::now();
         let bucket = &mut self.buckets[bucket_index as usize];
-        let Some(pos) = bucket.nodes.iter().position(|n| *n == node_id) else {
+        let Some(pos) = bucket.nodes.iter().position(|n| n.node_id == node_id) else {
             self.metrics.mark_active_miss += 1;
             return RoutingResult {
                 value: false,
@@ -291,14 +327,18 @@ impl RoutingTable {
             .nodes
             .remove(pos)
             .expect("node index from position must exist");
-        bucket.nodes.push_back(node);
+        bucket.nodes.push_back(Contact {
+            node_id: node.node_id,
+            last_seen: now,
+            status: NodeStatus::Active,
+        });
 
         if let Some(pending) = bucket.pending {
             if pending.stale_node == node_id {
                 if let Some(rep_pos) = bucket
                     .replacements
                     .iter()
-                    .position(|n| *n == pending.new_candidate)
+                    .position(|n| n.node_id == pending.new_candidate.node_id)
                 {
                     bucket.replacements.remove(rep_pos);
                 }
@@ -316,6 +356,80 @@ impl RoutingTable {
 
     pub fn mark_active(&mut self, node_id: NodeId) -> bool {
         self.mark_active_with_actions(node_id).value
+    }
+
+    pub fn process_ping_failure(&mut self, node_id: NodeId) -> PingFailureOutcome {
+        let Some(bucket_index) = self.bucket_index_for(&node_id) else {
+            return PingFailureOutcome::NotFound;
+        };
+
+        let now = Instant::now();
+        let bucket = &mut self.buckets[bucket_index as usize];
+        let Some(pos) = bucket.nodes.iter().position(|c| c.node_id == node_id) else {
+            return PingFailureOutcome::NotFound;
+        };
+
+        let contact = bucket
+            .nodes
+            .remove(pos)
+            .expect("contact index from position must exist");
+
+        match contact.status {
+            NodeStatus::Active => {
+                // Soft-mark and move to LRU head (front) as first eviction candidate.
+                bucket.nodes.push_front(Contact {
+                    node_id: contact.node_id,
+                    last_seen: contact.last_seen,
+                    status: NodeStatus::Suspected,
+                });
+                bucket.last_refreshed = now;
+                self.metrics.nodes_suspected += 1;
+                PingFailureOutcome::Suspected {
+                    bucket_index,
+                    node_id,
+                }
+            }
+            NodeStatus::Suspected => {
+                // Hard-evict after repeated failure; promote best replacement if any.
+                let replacement = bucket.replacements.pop_front().map(|mut c| {
+                    c.status = NodeStatus::Active;
+                    c.last_seen = now;
+                    c
+                });
+
+                if let Some(repl) = replacement {
+                    let replacement_id = repl.node_id;
+                    if !bucket.nodes.iter().any(|c| c.node_id == replacement_id) {
+                        bucket.nodes.push_back(repl);
+                    }
+                    if let Some(pending) = bucket.pending
+                        && pending.stale_node == node_id
+                    {
+                        bucket.pending = None;
+                    }
+                    bucket.last_refreshed = now;
+                    self.metrics.nodes_evicted += 1;
+                    PingFailureOutcome::Evicted {
+                        bucket_index,
+                        node_id,
+                        replaced_with: Some(replacement_id),
+                    }
+                } else {
+                    if let Some(pending) = bucket.pending
+                        && pending.stale_node == node_id
+                    {
+                        bucket.pending = None;
+                    }
+                    bucket.last_refreshed = now;
+                    self.metrics.nodes_evicted += 1;
+                    PingFailureOutcome::Evicted {
+                        bucket_index,
+                        node_id,
+                        replaced_with: None,
+                    }
+                }
+            }
+        }
     }
 
     pub fn replace_stale_with_actions(
@@ -343,7 +457,7 @@ impl RoutingTable {
         let bucket = &mut self.buckets[bucket_index as usize];
 
         if let Some(pending) = bucket.pending {
-            if pending.stale_node == dead_node && pending.new_candidate != new_candidate {
+            if pending.stale_node == dead_node && pending.new_candidate.node_id != new_candidate {
                 self.metrics.replace_stale_miss += 1;
                 return RoutingResult {
                     value: false,
@@ -352,7 +466,7 @@ impl RoutingTable {
             }
         }
 
-        let Some(dead_pos) = bucket.nodes.iter().position(|n| *n == dead_node) else {
+        let Some(dead_pos) = bucket.nodes.iter().position(|n| n.node_id == dead_node) else {
             self.metrics.replace_stale_miss += 1;
             return RoutingResult {
                 value: false,
@@ -361,11 +475,19 @@ impl RoutingTable {
         };
 
         bucket.nodes.remove(dead_pos);
-        if !bucket.nodes.contains(&new_candidate) {
-            bucket.nodes.push_back(new_candidate);
+        if !bucket.nodes.iter().any(|c| c.node_id == new_candidate) {
+            bucket.nodes.push_back(Contact {
+                node_id: new_candidate,
+                last_seen: now,
+                status: NodeStatus::Active,
+            });
         }
 
-        if let Some(rep_pos) = bucket.replacements.iter().position(|n| *n == new_candidate) {
+        if let Some(rep_pos) = bucket
+            .replacements
+            .iter()
+            .position(|n| n.node_id == new_candidate)
+        {
             bucket.replacements.remove(rep_pos);
         }
         bucket.pending = None;
@@ -390,8 +512,17 @@ impl RoutingTable {
         self.buckets[bucket_index as usize]
             .nodes
             .iter()
-            .copied()
+            .map(|c| c.node_id)
             .collect()
+    }
+
+    pub fn node_status(&self, node_id: NodeId) -> Option<NodeStatus> {
+        let bucket_index = self.bucket_index_for(&node_id)?;
+        self.buckets[bucket_index as usize]
+            .nodes
+            .iter()
+            .find(|c| c.node_id == node_id)
+            .map(|c| c.status)
     }
 
     pub fn find_closest_nodes(&self, target: NodeId, limit: usize) -> Vec<NodeId> {
@@ -402,7 +533,7 @@ impl RoutingTable {
         let mut nodes = self
             .buckets
             .iter()
-            .flat_map(|bucket| bucket.nodes.iter().copied())
+            .flat_map(|bucket| bucket.nodes.iter().map(|c| c.node_id))
             .collect::<Vec<_>>();
 
         nodes.sort_by(|a, b| {
@@ -826,5 +957,80 @@ mod tests {
         assert_eq!(snap.total_nodes, 1);
         assert_eq!(snap.non_empty_buckets, 1);
         assert_eq!(snap.max_bucket_len, 1);
+    }
+
+    #[test]
+    fn ping_failure_soft_marks_then_hard_evicts() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 2);
+
+        let mut a = [0u8; NODE_ID_LEN];
+        a[0] = 0x80;
+        a[31] = 1;
+        let a = NodeId::from_bytes(a);
+
+        table.insert(a);
+
+        let first = table.process_ping_failure(a);
+        assert_eq!(
+            first,
+            PingFailureOutcome::Suspected {
+                bucket_index: 255,
+                node_id: a,
+            }
+        );
+        assert_eq!(table.node_status(a), Some(NodeStatus::Suspected));
+
+        let second = table.process_ping_failure(a);
+        assert_eq!(
+            second,
+            PingFailureOutcome::Evicted {
+                bucket_index: 255,
+                node_id: a,
+                replaced_with: None,
+            }
+        );
+        assert_eq!(table.node_status(a), None);
+        assert_eq!(table.bucket_len(255), 0);
+    }
+
+    #[test]
+    fn hard_evict_promotes_replacement_candidate() {
+        let local = NodeId::from_bytes([0u8; NODE_ID_LEN]);
+        let mut table = RoutingTable::new(local, 1);
+
+        let mut a = [0u8; NODE_ID_LEN];
+        a[0] = 0x80;
+        a[31] = 1;
+        let a = NodeId::from_bytes(a);
+
+        let mut b = [0u8; NODE_ID_LEN];
+        b[0] = 0x80;
+        b[31] = 2;
+        let b = NodeId::from_bytes(b);
+
+        table.insert(a);
+        let overflow = table.insert_with_actions(b);
+        assert_eq!(
+            overflow.value,
+            InsertOutcome::PendingPing {
+                bucket_index: 255,
+                stale_node: a,
+                new_candidate: b,
+            }
+        );
+
+        let _ = table.process_ping_failure(a);
+        let evicted = table.process_ping_failure(a);
+        assert_eq!(
+            evicted,
+            PingFailureOutcome::Evicted {
+                bucket_index: 255,
+                node_id: a,
+                replaced_with: Some(b),
+            }
+        );
+        assert_eq!(table.node_status(b), Some(NodeStatus::Active));
+        assert_eq!(table.bucket_nodes(255), vec![b]);
     }
 }
