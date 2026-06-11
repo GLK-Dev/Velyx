@@ -14,7 +14,7 @@ use velyx::{
     ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
     ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
     chunk_control_message, negotiate, parse_server_and_validate,
-    dht::{DhtMetricsSnapshot, DhtStorage, NodeId, ProviderRecord, RoutingTable},
+    dht::{ContentKey, DhtMetricsSnapshot, DhtStorage, NodeId, ProviderRecord, RoutingTable},
 };
 use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
@@ -71,6 +71,7 @@ struct ResponderOptions {
     chaos: Option<ChaosConfig>,
     metrics_csv: Option<String>,
     stop_after_streams: Option<u32>,
+    provide_keys: Vec<ContentKey>,
 }
 
 struct InitiatorOptions {
@@ -78,6 +79,7 @@ struct InitiatorOptions {
     /// Disables 1ms inter-frame sleep for loopback benchmarks where the
     /// OS scheduler granularity would otherwise dominate run time.
     no_pacing: bool,
+    find_value_key: Option<ContentKey>,
 }
 
 struct BenchmarkOptions {
@@ -93,6 +95,11 @@ async fn main() -> Result<()> {
     if args.len() < 2 {
         print_usage();
         bail!("missing mode argument");
+    }
+
+    if matches!(args[1].as_str(), "--help" | "-h" | "help") {
+        print_usage();
+        return Ok(());
     }
 
     let mode = args[1].as_str();
@@ -121,6 +128,7 @@ async fn main() -> Result<()> {
                 chaos_middleware,
                 opts.metrics_csv,
                 opts.stop_after_streams,
+                opts.provide_keys,
                 local_node_id,
             )
             .await
@@ -131,13 +139,11 @@ async fn main() -> Result<()> {
                 bail!("initiator mode needs a remote address");
             }
             let bind_addr = args[2].as_str();
+            let opts = parse_initiator_options(&args)?;
             run_initiator(
                 bind_addr,
                 args[3].as_str(),
-                InitiatorOptions {
-                    payload_size_bytes: 80 * 135,
-                    no_pacing: false,
-                },
+                opts,
                 local_node_id,
             )
             .await
@@ -156,15 +162,16 @@ async fn main() -> Result<()> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  velyx responder <bind_addr> [chaos flags]");
-    println!("  velyx initiator <bind_addr> <remote_addr>");
+    println!("  velyx responder <bind_addr> [chaos flags] [--provide <content_key_hex>]");
+    println!("  velyx initiator <bind_addr> <remote_addr> [--find-value <content_key_hex>]");
     println!("  velyx benchmark [output_csv] [--max-runs N] [--payload-bytes N]");
     println!("Examples:");
     println!("  velyx responder 0.0.0.0:9000");
     println!("  velyx responder 0.0.0.0:9000 --chaos-drop-data-pct 30");
     println!("  velyx responder 0.0.0.0:9000 --chaos-scope all --chaos-jitter-ms 20 --chaos-reorder-pct 10");
     println!("  velyx responder 0.0.0.0:9000 --metrics-csv ./metrics.csv --chaos-drop-data-pct 30");
-    println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000");
+    println!("  velyx responder 0.0.0.0:9000 --provide 0123abcd...");
+    println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000 --find-value 0123abcd...");
     println!("  velyx benchmark ./whitepaper_benchmarks.csv");
     println!("  velyx benchmark ./whitepaper_benchmarks.csv --max-runs 1 --payload-bytes 262144");
 }
@@ -221,6 +228,7 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
             chaos: None,
             metrics_csv: None,
             stop_after_streams: None,
+            provide_keys: Vec::new(),
         });
     }
 
@@ -234,6 +242,7 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
         scope: ChaosScope::DataOnly,
     };
     let mut metrics_csv = None;
+    let mut provide_keys = Vec::new();
 
     let mut i = 3;
     while i < args.len() {
@@ -273,6 +282,9 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
             "--metrics-csv" => {
                 metrics_csv = Some(args[i + 1].to_string());
             }
+            "--provide" => {
+                provide_keys.push(parse_content_key_hex(&args[i + 1])?);
+            }
             other => {
                 print_usage();
                 bail!("unknown responder option: {other}");
@@ -286,7 +298,49 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
         chaos: Some(cfg.validate()?),
         metrics_csv,
         stop_after_streams: None,
+        provide_keys,
     })
+}
+
+fn parse_initiator_options(args: &[String]) -> Result<InitiatorOptions> {
+    let mut opts = InitiatorOptions {
+        payload_size_bytes: 80 * 135,
+        no_pacing: false,
+        find_value_key: None,
+    };
+
+    let mut i = 4;
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            print_usage();
+            bail!("missing value for option: {}", args[i]);
+        }
+
+        match args[i].as_str() {
+            "--find-value" => {
+                opts.find_value_key = Some(parse_content_key_hex(&args[i + 1])?);
+            }
+            other => {
+                print_usage();
+                bail!("unknown initiator option: {other}");
+            }
+        }
+
+        i += 2;
+    }
+
+    Ok(opts)
+}
+
+fn parse_content_key_hex(value: &str) -> Result<ContentKey> {
+    let bytes = hex::decode(value).with_context(|| format!("invalid content key hex: {value}"))?;
+    if bytes.len() != 32 {
+        bail!("content key must be exactly 32 bytes (64 hex chars), got {} bytes", bytes.len());
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(ContentKey::from_bytes(key))
 }
 
 fn parse_u8_opt(name: &str, value: &str) -> Result<u8> {
@@ -368,6 +422,7 @@ async fn run_responder(
     mut chaos: Option<DirtyNetwork>,
     metrics_csv: Option<String>,
     stop_after_streams: Option<u32>,
+    provide_keys: Vec<ContentKey>,
     local_node_id: NodeId,
 ) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
@@ -388,6 +443,23 @@ async fn run_responder(
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
     let mut completed_streams = 0u32;
+    let mut pending_provider_announcements = Vec::new();
+
+    let startup_now = std::time::Instant::now();
+    for key in provide_keys {
+        let record = ProviderRecord {
+            key,
+            provider_id: local_node_id,
+            expires_at: startup_now + DHT_PROVIDER_RECORD_TTL,
+        };
+        dht_storage.upsert_provider(record, startup_now);
+        pending_provider_announcements.push(record);
+        println!(
+            "[CLI] PROVIDE key={} provider={} queued on responder",
+            hex::encode(key.as_bytes()),
+            hex::encode(local_node_id.as_bytes())
+        );
+    }
 
     loop {
         let recv_result = timeout(
@@ -1231,6 +1303,71 @@ async fn run_responder(
             next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
         }
 
+        if !pending_provider_announcements.is_empty() {
+            let eligible_peers = peers
+                .iter()
+                .filter_map(|(peer_addr, session)| {
+                    (session.state == SessionState::Active
+                        && session.transport.is_some()
+                        && session.last_stream_id != [0u8; VWP_STREAM_ID_LEN])
+                        .then_some(*peer_addr)
+                })
+                .collect::<Vec<_>>();
+
+            if !eligible_peers.is_empty() {
+                let announcements = std::mem::take(&mut pending_provider_announcements);
+                for record in announcements {
+                    let mut delivered = false;
+                    for peer_addr in &eligible_peers {
+                        let Some(session) = peers.get_mut(peer_addr) else {
+                            continue;
+                        };
+                        let Some(transport) = session.transport.as_mut() else {
+                            continue;
+                        };
+
+                        let message_id = session.next_dht_message_id;
+                        session.next_dht_message_id = session.next_dht_message_id.wrapping_add(1);
+                        if let Err(err) = send_control_command(
+                            &socket,
+                            transport,
+                            &mut out_buf,
+                            session.session_id,
+                            &mut session.tx_seq,
+                            &mut session.vwp_tx_seq,
+                            session.last_stream_id,
+                            message_id,
+                            *peer_addr,
+                            StreamCommand::StoreProvider {
+                                key: record.key,
+                                provider_id: record.provider_id,
+                            },
+                        )
+                        .await
+                        {
+                            println!(
+                                "[CLI] PROVIDE key={} via {} failed: {err}",
+                                hex::encode(record.key.as_bytes()),
+                                peer_addr
+                            );
+                        } else {
+                            delivered = true;
+                        }
+                    }
+
+                    if delivered {
+                        println!(
+                            "[CLI] PROVIDE key={} announced to {} peer(s)",
+                            hex::encode(record.key.as_bytes()),
+                            eligible_peers.len()
+                        );
+                    } else {
+                        pending_provider_announcements.push(record);
+                    }
+                }
+            }
+        }
+
         // Active discovery loop: periodically ask peers for nodes near our own ID.
         for (peer_addr, session) in peers.iter_mut() {
             if session.state != SessionState::Active {
@@ -1557,6 +1694,8 @@ async fn run_initiator(
     let mut next_metrics_log = std::time::Instant::now() + DHT_METRICS_LOG_INTERVAL;
     let mut sent_frames = 0usize;
     let mut logged_waiting_for_stop = false;
+    let mut pending_cli_find_value = options.find_value_key;
+    let mut cli_find_in_flight = false;
 
     // Data frames start after control frame sequence space.
     stream_sender = StreamSender::new(stream_id, &data_blob, 1300, vwp_data_seq, 24)?;
@@ -1669,6 +1808,30 @@ async fn run_initiator(
         if now >= next_metrics_log {
             log_dht_metrics("initiator", dht.metrics_snapshot());
             next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
+        }
+
+        if let Some(key) = pending_cli_find_value
+            && acked_chunks >= expected_acks
+            && !cli_find_in_flight
+        {
+            let message_id = next_dht_message_id;
+            next_dht_message_id = next_dht_message_id.wrapping_add(1);
+            send_control_command(
+                &socket,
+                &mut transport,
+                &mut out_buf,
+                session_id,
+                &mut tx_seq,
+                &mut vwp_data_seq,
+                stream_id,
+                message_id,
+                remote,
+                StreamCommand::FindValue { key },
+            )
+            .await
+            .context("send CLI DHT FIND_VALUE")?;
+            println!("[CLI] FIND key={} -> queued", hex::encode(key.as_bytes()));
+            cli_find_in_flight = true;
         }
 
         let timed_out = pending_pings
@@ -2147,12 +2310,34 @@ async fn run_initiator(
                                 hex::encode(key.as_bytes()),
                                 providers.len()
                             );
+                            if pending_cli_find_value == Some(key) {
+                                println!(
+                                    "[CLI] FIND key={} -> Found Providers: {:?}",
+                                    hex::encode(key.as_bytes()),
+                                    providers
+                                        .iter()
+                                        .map(|provider_id| hex::encode(provider_id.as_bytes()))
+                                        .collect::<Vec<_>>()
+                                );
+                                pending_cli_find_value = None;
+                                    cli_find_in_flight = false;
+                            }
                         }
                         Ok(StreamCommand::NodesFound { nodes }) => {
                             println!(
                                 "Received DHT NODES_FOUND from responder (count={})",
                                 nodes.len()
                             );
+
+                            if let Some(key) = pending_cli_find_value {
+                                println!(
+                                    "[CLI] FIND key={} -> MISS (closest_nodes={})",
+                                    hex::encode(key.as_bytes()),
+                                    nodes.len()
+                                );
+                                pending_cli_find_value = None;
+                                cli_find_in_flight = false;
+                            }
 
                             let actions = dht.nodes_found_received(nodes);
                             for action in actions {
@@ -2259,7 +2444,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                     let responder_node_id = benchmark_node_id((run_id as u64) << 1);
                     async move {
                         let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xBADC0DE + run_id as u64)?);
-                        run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), responder_node_id).await
+                        run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), Vec::new(), responder_node_id).await
                     }
                 });
 
@@ -2272,6 +2457,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                     InitiatorOptions {
                         payload_size_bytes: options.payload_size_bytes,
                         no_pacing: false,
+                        find_value_key: None,
                     },
                     benchmark_node_id(((run_id as u64) << 1) | 1),
                 )
@@ -2381,7 +2567,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
             let responder_node_id = benchmark_node_id((run_id as u64) << 1);
             async move {
                 let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xDEAD0000 + run_id as u64)?);
-                run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), responder_node_id).await
+                run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), Vec::new(), responder_node_id).await
             }
         });
 
@@ -2394,6 +2580,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
             InitiatorOptions {
                 payload_size_bytes: options.payload_size_bytes,
                 no_pacing: false,
+                find_value_key: None,
             },
             benchmark_node_id(((run_id as u64) << 1) | 1),
         )
