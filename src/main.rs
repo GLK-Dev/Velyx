@@ -28,6 +28,7 @@ const DHT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const DHT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(20);
 const DHT_REFRESH_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DHT_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const DHT_PING_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SessionState {
@@ -55,6 +56,7 @@ struct PeerSession {
     stream_receiver: StreamReceiver,
     last_stream_id: [u8; VWP_STREAM_ID_LEN],
     next_dht_message_id: u32,
+    pending_pings: HashMap<NodeId, std::time::Instant>,
     next_discovery_at: std::time::Instant,
     reorder_hold: Option<VwpFrame>,
     telemetry: StreamTelemetry,
@@ -329,7 +331,7 @@ fn log_dht_metrics(role: &str, snapshot: DhtMetricsSnapshot) {
     let bucket_fill_ratio = snapshot.bucket_fill_ratio(20);
     let m = snapshot.metrics;
     println!(
-        "[DHT][metrics][{role}] nodes={} non_empty_buckets={} max_bucket_len={} bucket_fill_ratio={:.3} ping_success_rate={:.3} avg_nodes_per_batch={:.2} inserted={} existing={} pending={} ignored={} mark_ok={} mark_miss={} replace_ok={} replace_miss={} lookup_queries={} nodes_found_batches={} nodes_found_nodes={} refresh_marked={} actions_ping={} actions_lookup={}",
+        "[DHT][metrics][{role}] nodes={} non_empty_buckets={} max_bucket_len={} bucket_fill_ratio={:.3} ping_success_rate={:.3} avg_nodes_per_batch={:.2} inserted={} existing={} pending={} ignored={} mark_ok={} mark_miss={} replace_ok={} replace_miss={} suspected={} evicted={} lookup_queries={} nodes_found_batches={} nodes_found_nodes={} refresh_marked={} actions_ping={} actions_lookup={}",
         snapshot.total_nodes,
         snapshot.non_empty_buckets,
         snapshot.max_bucket_len,
@@ -344,6 +346,8 @@ fn log_dht_metrics(role: &str, snapshot: DhtMetricsSnapshot) {
         m.mark_active_miss,
         m.replace_stale_ok,
         m.replace_stale_miss,
+        m.nodes_suspected,
+        m.nodes_evicted,
         m.lookup_queries,
         m.nodes_found_batches,
         m.nodes_found_nodes_total,
@@ -705,6 +709,7 @@ async fn run_responder(
                                     "[{remote}] Received DHT PONG sender_id={}",
                                     hex::encode(sender_id.as_bytes())
                                 );
+                                session.pending_pings.remove(&sender_id);
                                 dht_routes.insert(sender_id, remote);
                                 let mark_result = dht.mark_active_with_actions(sender_id);
                                 pending_dht_actions.extend(mark_result.actions);
@@ -923,6 +928,7 @@ async fn run_responder(
                         stream_receiver: StreamReceiver::default(),
                         last_stream_id: [0u8; VWP_STREAM_ID_LEN],
                         next_dht_message_id: 100,
+                        pending_pings: HashMap::new(),
                         next_discovery_at: std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY,
                         control_assembler: ControlAssembler::default(),
                         reorder_hold: None,
@@ -951,7 +957,9 @@ async fn run_responder(
                 let Some(executed) = execute_dht_action(action, local_node_id) else {
                     continue;
                 };
+                let route_to = executed.route_to;
                 let command = executed.command;
+                let is_ping = matches!(command, StreamCommand::Ping { .. });
                 let target_addr = if let Some(route_to) = executed.route_to {
                     let Some(addr) = dht_routes.get(&route_to).copied() else {
                         println!(
@@ -1006,6 +1014,10 @@ async fn run_responder(
                 .await
                 {
                     println!("Failed to execute DHT action toward {target_addr}: {err}");
+                } else if let Some(target_node) = route_to.filter(|_| is_ping) {
+                    target_session
+                        .pending_pings
+                        .insert(target_node, std::time::Instant::now());
                 }
             }
         }
@@ -1072,6 +1084,35 @@ async fn run_responder(
                 println!("[{peer_addr}] Active discovery FIND_NODE send failed: {err}");
             }
             session.next_discovery_at = now + DHT_DISCOVERY_INTERVAL;
+        }
+
+        // Liveness watchdog for outstanding DHT pings.
+        for (peer_addr, session) in peers.iter_mut() {
+            if session.pending_pings.is_empty() {
+                continue;
+            }
+
+            let timed_out = session
+                .pending_pings
+                .iter()
+                .filter_map(|(node_id, sent_at)| {
+                    (now.duration_since(*sent_at) > DHT_PING_TIMEOUT).then_some(*node_id)
+                })
+                .collect::<Vec<_>>();
+
+            for node_id in timed_out {
+                session.pending_pings.remove(&node_id);
+                let outcome = dht.process_ping_failure(node_id);
+                println!(
+                    "[DHT] Ping timeout for {} via {} -> {:?}",
+                    hex::encode(node_id.as_bytes()),
+                    peer_addr,
+                    outcome
+                );
+                if let velyx::dht::PingFailureOutcome::Evicted { node_id, .. } = outcome {
+                    dht_routes.remove(&node_id);
+                }
+            }
         }
 
         // Handle retransmits for Closing sessions
@@ -1323,6 +1364,7 @@ async fn run_initiator(
     let mut local_control_assembler = ControlAssembler::default();
     let mut dht = RoutingTable::new(local_node_id, 20);
     let mut dht_routes: HashMap<NodeId, ([u8; VWP_STREAM_ID_LEN], SocketAddr)> = HashMap::new();
+    let mut pending_pings: HashMap<NodeId, std::time::Instant> = HashMap::new();
     let mut next_dht_message_id = 100u32;
     let mut next_discovery_at = std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY;
     let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
@@ -1443,6 +1485,25 @@ async fn run_initiator(
             next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
         }
 
+        let timed_out = pending_pings
+            .iter()
+            .filter_map(|(node_id, sent_at)| {
+                (now.duration_since(*sent_at) > DHT_PING_TIMEOUT).then_some(*node_id)
+            })
+            .collect::<Vec<_>>();
+        for node_id in timed_out {
+            pending_pings.remove(&node_id);
+            let outcome = dht.process_ping_failure(node_id);
+            println!(
+                "[DHT] Ping timeout for {} via initiator -> {:?}",
+                hex::encode(node_id.as_bytes()),
+                outcome
+            );
+            if let velyx::dht::PingFailureOutcome::Evicted { node_id, .. } = outcome {
+                dht_routes.remove(&node_id);
+            }
+        }
+
         let poll_timeout = if acked_chunks >= expected_acks { 12 } else { 3 };
         let recv_result = timeout(
             Duration::from_millis(poll_timeout),
@@ -1550,7 +1611,9 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
+                                let route_to = executed.route_to;
                                 let command = executed.command;
+                                let is_ping = matches!(command, StreamCommand::Ping { .. });
                                 let (target_stream_id, target_addr) =
                                     if let Some(route_to) = executed.route_to {
                                         let Some(route) = dht_routes.get(&route_to).copied() else {
@@ -1581,6 +1644,9 @@ async fn run_initiator(
                                 )
                                 .await
                                 .context("execute DHT action from insert result")?;
+                                if let Some(target_node) = route_to.filter(|_| is_ping) {
+                                    pending_pings.insert(target_node, std::time::Instant::now());
+                                }
                             }
 
                             let message_id = next_dht_message_id;
@@ -1607,6 +1673,7 @@ async fn run_initiator(
                                 "Received DHT PONG from responder (sender_id={})",
                                 hex::encode(sender_id.as_bytes())
                             );
+                            pending_pings.remove(&sender_id);
                             dht_routes.insert(sender_id, (control_stream_id, remote));
 
                             let mark_result = dht.mark_active_with_actions(sender_id);
@@ -1615,7 +1682,9 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
+                                let route_to = executed.route_to;
                                 let command = executed.command;
+                                let is_ping = matches!(command, StreamCommand::Ping { .. });
                                 let (target_stream_id, target_addr) =
                                     if let Some(route_to) = executed.route_to {
                                         let Some(route) = dht_routes.get(&route_to).copied() else {
@@ -1646,6 +1715,9 @@ async fn run_initiator(
                                 )
                                 .await
                                 .context("execute DHT action from mark_active result")?;
+                                if let Some(target_node) = route_to.filter(|_| is_ping) {
+                                    pending_pings.insert(target_node, std::time::Instant::now());
+                                }
                             }
                         }
                         Ok(StreamCommand::FindNode { target_id }) => {
@@ -1684,7 +1756,9 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
+                                let route_to = executed.route_to;
                                 let command = executed.command;
+                                let is_ping = matches!(command, StreamCommand::Ping { .. });
                                 let (target_stream_id, target_addr) =
                                     if let Some(route_to) = executed.route_to {
                                         let Some(route) = dht_routes.get(&route_to).copied() else {
@@ -1715,6 +1789,9 @@ async fn run_initiator(
                                 )
                                 .await
                                 .context("execute DHT action from nodes_found result")?;
+                                if let Some(target_node) = route_to.filter(|_| is_ping) {
+                                    pending_pings.insert(target_node, std::time::Instant::now());
+                                }
                             }
                         }
                         Err(err) => {
