@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+mod dht_bridge;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::collections::HashMap;
@@ -14,11 +15,13 @@ use velyx::{
     ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
     ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
     chunk_control_message, negotiate, parse_server_and_validate,
+    dht::{NodeId, RoutingTable},
 };
 use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
     StreamSender, StreamTelemetry, append_metrics_csv,
 };
+use crate::dht_bridge::{route_action_to_command, send_control_command};
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
@@ -46,6 +49,8 @@ struct PeerSession {
     transport: Option<TransportState>,
     control_assembler: ControlAssembler,
     stream_receiver: StreamReceiver,
+    last_stream_id: [u8; VWP_STREAM_ID_LEN],
+    next_dht_message_id: u32,
     reorder_hold: Option<VwpFrame>,
     telemetry: StreamTelemetry,
     state: SessionState,
@@ -84,6 +89,7 @@ async fn main() -> Result<()> {
 
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
+    let local_node_id = NodeId::from_bytes(*signing_key.verifying_key().as_bytes());
     let peer_id = hex::encode(signing_key.verifying_key().as_bytes());
     println!("Velyx node started");
     println!("Peer ID (ed25519): {peer_id}");
@@ -105,6 +111,7 @@ async fn main() -> Result<()> {
                 chaos_middleware,
                 opts.metrics_csv,
                 opts.stop_after_streams,
+                local_node_id,
             )
             .await
         }
@@ -121,6 +128,7 @@ async fn main() -> Result<()> {
                     payload_size_bytes: 80 * 135,
                     no_pacing: false,
                 },
+                local_node_id,
             )
             .await
             .map(|_| ())
@@ -294,11 +302,28 @@ fn noise_private_key() -> Result<Vec<u8>> {
     Ok(keypair.private)
 }
 
+fn benchmark_node_id(seed: u64) -> NodeId {
+    let mut state = if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    };
+    let mut bytes = [0u8; 32];
+    for b in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *b = (state & 0xFF) as u8;
+    }
+    NodeId::from_bytes(bytes)
+}
+
 async fn run_responder(
     bind_addr: &str,
     mut chaos: Option<DirtyNetwork>,
     metrics_csv: Option<String>,
     stop_after_streams: Option<u32>,
+    local_node_id: NodeId,
 ) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
         .await
@@ -308,6 +333,9 @@ async fn run_responder(
     let static_key = noise_private_key()?;
     let local = local_caps();
     let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
+    let mut dht = RoutingTable::new(local_node_id, 20);
+    let mut dht_routes: HashMap<NodeId, SocketAddr> = HashMap::new();
+    let mut pending_dht_actions = Vec::new();
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
     let mut completed_streams = 0u32;
@@ -501,6 +529,7 @@ async fn run_responder(
 
             match vwp.frame_type {
                 VwpFrameType::Control => {
+                    session.last_stream_id = vwp.stream_id;
                     let chunk = match ControlChunk::decode(&vwp.payload) {
                         Ok(chunk) => chunk,
                         Err(err) => {
@@ -572,23 +601,76 @@ async fn run_responder(
                             continue;
                         }
 
-                        match session.stream_receiver.on_control_payload(&full) {
-                            Ok(StreamControlEvent::Started) => {
-                                if let Ok(StreamCommand::StreamStart(cfg)) = StreamCommand::decode(&full) {
-                                    session.telemetry.on_stream_start(cfg);
-                                    println!(
-                                        "[{remote}] Stream started: symbol_size={}, transfer_length={}",
-                                        cfg.symbol_size(),
-                                        cfg.transfer_length()
-                                    );
+                        match StreamCommand::decode(&full) {
+                            Ok(StreamCommand::StreamStart(cfg)) => {
+                                match session.stream_receiver.on_control_payload(&full) {
+                                    Ok(StreamControlEvent::Started) => {
+                                        session.telemetry.on_stream_start(cfg);
+                                        println!(
+                                            "[{remote}] Stream started: symbol_size={}, transfer_length={}",
+                                            cfg.symbol_size(),
+                                            cfg.transfer_length()
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        println!("[{remote}] STREAM_START produced unexpected receiver event");
+                                    }
+                                    Err(err) => {
+                                        println!("[{remote}] Invalid STREAM_START payload: {err}");
+                                    }
                                 }
                             }
-                            Ok(StreamControlEvent::Stopped) => {
-                                println!("[{remote}] Stream stopped by remote request");
+                            Ok(StreamCommand::StopStream) => {
+                                match session.stream_receiver.on_control_payload(&full) {
+                                    Ok(StreamControlEvent::Stopped) => {
+                                        println!("[{remote}] Stream stopped by remote request");
+                                    }
+                                    Ok(_) => {
+                                        println!("[{remote}] STOP_STREAM produced unexpected receiver event");
+                                    }
+                                    Err(err) => {
+                                        println!("[{remote}] Invalid STOP_STREAM payload: {err}");
+                                    }
+                                }
                             }
-                            Ok(StreamControlEvent::Ignored) => {
-                                let as_text = String::from_utf8_lossy(&full);
-                                println!("[{remote}] Control payload ignored: {as_text}");
+                            Ok(StreamCommand::Ping { sender_id }) => {
+                                println!(
+                                    "[{remote}] Received DHT PING sender_id={}",
+                                    hex::encode(sender_id.as_bytes())
+                                );
+                                dht_routes.insert(sender_id, remote);
+                                let insert_result = dht.insert_with_actions(sender_id);
+                                pending_dht_actions.extend(insert_result.actions);
+
+                                let message_id = session.next_dht_message_id;
+                                session.next_dht_message_id = session.next_dht_message_id.wrapping_add(1);
+                                if let Err(err) = send_control_command(
+                                    &socket,
+                                    transport,
+                                    &mut out_buf,
+                                    session.session_id,
+                                    &mut session.tx_seq,
+                                    &mut session.vwp_tx_seq,
+                                    session.last_stream_id,
+                                    message_id,
+                                    remote,
+                                    StreamCommand::Pong {
+                                        sender_id: local_node_id,
+                                    },
+                                )
+                                .await
+                                {
+                                    println!("[{remote}] Failed to send DHT PONG: {err}");
+                                }
+                            }
+                            Ok(StreamCommand::Pong { sender_id }) => {
+                                println!(
+                                    "[{remote}] Received DHT PONG sender_id={}",
+                                    hex::encode(sender_id.as_bytes())
+                                );
+                                dht_routes.insert(sender_id, remote);
+                                let mark_result = dht.mark_active_with_actions(sender_id);
+                                pending_dht_actions.extend(mark_result.actions);
                             }
                             Err(err) => {
                                 println!("[{remote}] Invalid stream control payload: {err}");
@@ -767,6 +849,8 @@ async fn run_responder(
                         recv_replay: ReplayWindow::default(),
                         vwp_tx_seq: 0,
                         stream_receiver: StreamReceiver::default(),
+                        last_stream_id: [0u8; VWP_STREAM_ID_LEN],
+                        next_dht_message_id: 100,
                         control_assembler: ControlAssembler::default(),
                         reorder_hold: None,
                         telemetry: StreamTelemetry::default(),
@@ -785,6 +869,54 @@ async fn run_responder(
             // Timeout on recv, handle retransmits
         }
     } // close match recv_result
+
+        if !pending_dht_actions.is_empty() {
+            let actions = std::mem::take(&mut pending_dht_actions);
+            for action in actions {
+                let (target_id, command) = route_action_to_command(action, local_node_id);
+                let Some(target_addr) = dht_routes.get(&target_id).copied() else {
+                    println!(
+                        "Skipping DHT action: no known route for target_id={}",
+                        hex::encode(target_id.as_bytes())
+                    );
+                    continue;
+                };
+
+                let Some(target_session) = peers.get_mut(&target_addr) else {
+                    println!("Skipping DHT action: target session not found for {target_addr}");
+                    continue;
+                };
+                let Some(target_transport) = target_session.transport.as_mut() else {
+                    println!("Skipping DHT action: target transport not ready for {target_addr}");
+                    continue;
+                };
+                if target_session.last_stream_id == [0u8; VWP_STREAM_ID_LEN] {
+                    println!("Skipping DHT action: no stream_id known yet for {target_addr}");
+                    continue;
+                }
+
+                let message_id = target_session.next_dht_message_id;
+                target_session.next_dht_message_id =
+                    target_session.next_dht_message_id.wrapping_add(1);
+
+                if let Err(err) = send_control_command(
+                    &socket,
+                    target_transport,
+                    &mut out_buf,
+                    target_session.session_id,
+                    &mut target_session.tx_seq,
+                    &mut target_session.vwp_tx_seq,
+                    target_session.last_stream_id,
+                    message_id,
+                    target_addr,
+                    command,
+                )
+                .await
+                {
+                    println!("Failed to execute DHT action toward {target_addr}: {err}");
+                }
+            }
+        }
 
         // Handle retransmits for Closing sessions
         let now = std::time::Instant::now();
@@ -876,6 +1008,7 @@ async fn run_initiator(
     bind_addr: &str,
     remote_addr: &str,
     options: InitiatorOptions,
+    local_node_id: NodeId,
 ) -> Result<bool> {
     let socket = UdpSocket::bind(bind_addr)
         .await
@@ -1033,6 +1166,9 @@ async fn run_initiator(
     let mut vwp_data_seq = control_frames.len() as u32;
     let mut stop_received = false;
     let mut local_control_assembler = ControlAssembler::default();
+    let mut dht = RoutingTable::new(local_node_id, 20);
+    let mut dht_routes: HashMap<NodeId, ([u8; VWP_STREAM_ID_LEN], SocketAddr)> = HashMap::new();
+    let mut next_dht_message_id = 100u32;
     let mut sent_frames = 0usize;
     let mut logged_waiting_for_stop = false;
 
@@ -1123,6 +1259,7 @@ async fn run_initiator(
                 println!("Received VWP data response: {response}");
             }
             VwpFrameType::Control => {
+                let control_stream_id = frame.stream_id;
                 let chunk = ControlChunk::decode(&frame.payload).context("decode control chunk")?;
 
                 let ack = ControlAck {
@@ -1171,12 +1308,91 @@ async fn run_initiator(
                                 "Received DHT PING from responder (sender_id={})",
                                 hex::encode(sender_id.as_bytes())
                             );
+                            dht_routes.insert(sender_id, (control_stream_id, remote));
+
+                            let insert_result = dht.insert_with_actions(sender_id);
+                            for action in insert_result.actions {
+                                let (target_id, command) = route_action_to_command(action, local_node_id);
+                                let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
+                                    println!(
+                                        "Skipping DHT action: no known route for target_id={}",
+                                        hex::encode(target_id.as_bytes())
+                                    );
+                                    continue;
+                                };
+
+                                let message_id = next_dht_message_id;
+                                next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    target_stream_id,
+                                    message_id,
+                                    target_addr,
+                                    command,
+                                )
+                                .await
+                                .context("execute DHT action from insert result")?;
+                            }
+
+                            let message_id = next_dht_message_id;
+                            next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                            send_control_command(
+                                &socket,
+                                &mut transport,
+                                &mut out_buf,
+                                session_id,
+                                &mut tx_seq,
+                                &mut vwp_data_seq,
+                                control_stream_id,
+                                message_id,
+                                remote,
+                                StreamCommand::Pong {
+                                    sender_id: local_node_id,
+                                },
+                            )
+                            .await
+                            .context("send DHT PONG")?;
                         }
                         Ok(StreamCommand::Pong { sender_id }) => {
                             println!(
                                 "Received DHT PONG from responder (sender_id={})",
                                 hex::encode(sender_id.as_bytes())
                             );
+                            dht_routes.insert(sender_id, (control_stream_id, remote));
+
+                            let mark_result = dht.mark_active_with_actions(sender_id);
+                            for action in mark_result.actions {
+                                let (target_id, command) = route_action_to_command(action, local_node_id);
+                                let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
+                                    println!(
+                                        "Skipping DHT action: no known route for target_id={}",
+                                        hex::encode(target_id.as_bytes())
+                                    );
+                                    continue;
+                                };
+
+                                let message_id = next_dht_message_id;
+                                next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                                send_control_command(
+                                    &socket,
+                                    &mut transport,
+                                    &mut out_buf,
+                                    session_id,
+                                    &mut tx_seq,
+                                    &mut vwp_data_seq,
+                                    target_stream_id,
+                                    message_id,
+                                    target_addr,
+                                    command,
+                                )
+                                .await
+                                .context("execute DHT action from mark_active result")?;
+                            }
                         }
                         Err(err) => {
                             println!("Failed to decode responder control command: {err}");
@@ -1236,9 +1452,10 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                 let responder = tokio::spawn({
                     let bind_addr = bind_addr.clone();
                     let metrics_path = per_run_metrics.clone();
+                    let responder_node_id = benchmark_node_id((run_id as u64) << 1);
                     async move {
                         let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xBADC0DE + run_id as u64)?);
-                        run_responder(&bind_addr, dirty, Some(metrics_path), Some(1)).await
+                        run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), responder_node_id).await
                     }
                 });
 
@@ -1252,6 +1469,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                         payload_size_bytes: options.payload_size_bytes,
                         no_pacing: false,
                     },
+                    benchmark_node_id(((run_id as u64) << 1) | 1),
                 )
                 .await;
 
@@ -1356,9 +1574,10 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
         let responder = tokio::spawn({
             let bind_addr = bind_addr.clone();
             let metrics_path = per_run_metrics.clone();
+            let responder_node_id = benchmark_node_id((run_id as u64) << 1);
             async move {
                 let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xDEAD0000 + run_id as u64)?);
-                run_responder(&bind_addr, dirty, Some(metrics_path), Some(1)).await
+                run_responder(&bind_addr, dirty, Some(metrics_path), Some(1), responder_node_id).await
             }
         });
 
@@ -1372,6 +1591,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                 payload_size_bytes: options.payload_size_bytes,
                 no_pacing: false,
             },
+            benchmark_node_id(((run_id as u64) << 1) | 1),
         )
         .await;
 
