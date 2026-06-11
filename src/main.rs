@@ -1062,8 +1062,14 @@ async fn run_initiator(
             .await
             .context("failed to send raptor data frame")?;
 
-        // Pacing to avoid local UDP queue overflow (disabled in benchmark/loopback mode).
-        if !options.no_pacing {
+        // Pacing to avoid local UDP queue overflow.
+        // In benchmark mode we keep turbo throughput, but yield every 16 frames
+        // to avoid socket-level burst reordering that can desync Noise counters.
+        if options.no_pacing {
+            if sent_frames % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+        } else {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
@@ -1232,7 +1238,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                     &remote_addr,
                     InitiatorOptions {
                         payload_size_bytes: options.payload_size_bytes,
-                        no_pacing: true,
+                        no_pacing: false,
                     },
                 )
                 .await;
@@ -1352,7 +1358,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
             &remote_addr,
             InitiatorOptions {
                 payload_size_bytes: options.payload_size_bytes,
-                no_pacing: true,
+                no_pacing: false,
             },
         )
         .await;

@@ -1,12 +1,36 @@
-# Velyx Protocol Whitepaper (Draft v0.1)
+# Velyx: A Censorship-Resilient, Fountain-Encoded Peer-to-Peer Protocol
 
-Author: mjojo (https://github.com/GLK-Dev)
+**Authors:** Vitaliy Golik, mjojo (https://github.com/GLK-Dev)
+**Status:** Draft / Active Development  
+**Date:** June 2026
 
 ## Abstract
-Velyx is a censorship-resilient, privacy-first, and high-availability P2P protocol intended for global open standardization.
-The protocol combines modern authenticated encryption, metadata minimization, and erasure/fountain-style data coding to improve survivability and transfer continuity under adversarial network conditions.
 
-## 1. Problem Statement
+Historically, peer-to-peer (P2P) networks have depended either on stateful transport protocols such as TCP or on rigid block-based file segmentation such as BitTorrent. Those architectural choices leave modern decentralized systems vulnerable to deep packet inspection (DPI) and cause catastrophic throughput degradation in high-loss environments such as mobile networks and satellite links.
+
+This document presents **Velyx**, a next-generation P2P protocol designed for privacy and high availability in hostile network conditions. By decoupling data availability from delivery order through forward error correction (RaptorQ FEC) and encapsulating all traffic inside Noise Protocol Framework handshakes over UDP, Velyx targets sub-millisecond connection setup. The protocol is designed to preserve data recovery and teardown correctness even under 50% packet loss.
+
+---
+
+## 1. Introduction
+
+The modern internet is increasingly fragmented by enterprise firewalls, NAT, and state-level censorship systems. In that environment, builders of decentralized applications, messaging systems, and file distribution networks face two fundamental problems that legacy protocols do not solve well:
+
+1. **Handshake and metadata fragility:** Older protocols expose signatures that are easy to recognize. ISP filters can tear down a session simply by identifying a BitTorrent bootstrap packet or an openly visible peer address in a distributed hash table (DHT).
+2. **The rare-piece problem and retransmission collapse:** In topologies with jitter and sustained loss, 10-20% packet loss can trigger a retransmission storm. Classical congestion-control logic reduces throughput sharply, and swarms can stall entirely if a peer carrying a rare piece disappears.
+
+### 1.1 Architectural response in Velyx
+
+Velyx addresses those issues by replacing rigid delivery assumptions with probabilistic and cryptographically opaque mechanisms. The protocol is built around three ideas:
+
+* **Infinite Swarm Dynamics:** Instead of fixed file blocks, Velyx uses fountain coding (RaptorQ) to stream an endless sequence of unique symbols. A receiver only needs enough symbols from any peers in the swarm, which makes a permanently stalled transfer mathematically avoidable.
+* **Cryptographic invisibility:** The `Noise_XX` pattern over UDP hides peer identity from the first byte. To an outside observer, Velyx traffic is difficult to distinguish from random noise or ordinary encrypted real-time media traffic.
+* **Resilient state management:** The protocol separates an asynchronous data path from a reliable control path with exponential backoff, so critical teardown and acknowledgment traffic can still complete during adverse network conditions.
+
+Velyx aims to become an open, developer-owned standard for data transfer in hostile network environments: an API that is faster than TCP in the scenarios that matter and harder to block without disrupting the network around it.
+
+## 2. Problem Statement
+
 Current P2P systems still face four persistent constraints:
 
 1. DPI detectability and selective throttling.
@@ -14,7 +38,8 @@ Current P2P systems still face four persistent constraints:
 3. Content availability collapse when rare blocks disappear.
 4. Upgrade friction when cryptographic primitives evolve.
 
-## 2. Goals and Non-Goals
+## 3. Goals and Non-Goals
+
 ### Goals
 1. Fast authenticated session setup over UDP-based transport.
 2. Strong forward secrecy and cryptographic agility.
@@ -27,7 +52,8 @@ Current P2P systems still face four persistent constraints:
 2. Immediate replacement of all existing BitTorrent deployments.
 3. Mandatory token economics at protocol layer.
 
-## 3. Threat Model
+## 4. Threat Model
+
 Velyx defends primarily against:
 
 1. Passive traffic collection.
@@ -37,14 +63,14 @@ Velyx defends primarily against:
 
 Velyx does not assume trusted infrastructure and should remain useful with partially malicious peers.
 
-## 4. Protocol Stack
+## 5. Protocol Stack
 1. Transport Layer: UDP baseline, QUIC-compatible framing path for future versions.
 2. Secure Channel Layer: Noise framework handshake (initially XX pattern).
 3. Peer Discovery Layer: DHT-compatible routing and optional rendezvous relays.
 4. Data Plane Layer: chunk graph + fountain/FEC extension.
 5. Control Plane Layer: session management, capability negotiation, and versioning.
 
-## 4.1 Formal Wire Format (V1)
+## 5.1 Formal Wire Format (V1)
 Binary packet format (network byte order / big-endian):
 
 1. magic[4]: ASCII VLYX.
@@ -74,13 +100,13 @@ Replay protection:
 2. Duplicate seq is rejected.
 3. Too-old seq outside the window is rejected.
 
-## 5. Cryptography
+## 6. Cryptography
 1. Session handshake: Noise_XX_25519_ChaChaPoly_BLAKE2s (MVP baseline).
 2. Node identity: Ed25519 public key as stable peer identity.
 3. Forward secrecy: ephemeral DH in each session handshake.
 4. Roadmap: post-quantum hybrid KEM option (e.g., Kyber + X25519).
 
-## 5.1 Capability Negotiation
+## 6.1 Capability Negotiation
 Handshake payloads carry explicit capability and version ranges:
 
 1. ClientHello: min_version, max_version, capability_mask.
@@ -93,7 +119,7 @@ Selection algorithm:
 2. capabilities = bitwise intersection of both masks.
 3. If no version overlap exists, handshake fails.
 
-## 6. Data Dissemination and Integrity
+## 7. Data Dissemination and Integrity
 Velyx roadmap introduces a fountain/FEC mode for swarm resilience:
 
 1. Source object split into k symbols.
@@ -106,12 +132,12 @@ P_success(m) ~ 1 - 256^(-m)
 
 This removes strict dependence on rare block availability and improves recovery under churn.
 
-## 7. Anti-Censorship Strategy
+## 8. Anti-Censorship Strategy
 1. Pluggable transports with traffic-shape adaptation.
 2. Session camouflage profiles (timing and packet-size envelopes).
 3. Optional relay-assisted NAT traversal and fallback routes.
 
-## 8. Governance and Standardization
+## 9. Governance and Standardization
 1. Open-source reference implementation (Rust) under copyleft or dual-license model.
 2. VEP process (Velyx Enhancement Proposals).
 3. Security audits, reproducible builds, and interop test vectors.
@@ -120,7 +146,7 @@ This removes strict dependence on rare block availability and improves recovery 
 6. Error and ACK semantics draft: VEP-003.
 7. Session lifecycle/state machine draft: VEP-004.
 
-## 9. MVP Scope (Current Implementation)
+## 10. MVP Scope (Current Implementation)
 1. Peer ID generation (Ed25519).
 2. UDP socket communication.
 3. Formal wire framing (header, type tags, version field, session_id, seq).
@@ -129,16 +155,16 @@ This removes strict dependence on rare block availability and improves recovery 
 6. Capability negotiation during handshake payload exchange.
 7. Encrypted ping/pong exchange after handshake.
 
-## 10. Milestones
+## 11. Milestones
 1. M1: handshake + encrypted transport baseline.
 2. M2: DHT discovery + NAT traversal prototype.
 3. M3: coded data plane (fountain/FEC).
 4. M4: obfuscation plugin framework.
 5. M5: third-party security review and VEP-1 release.
 
-## 11. Empirical Results and Benchmarks
+## 12. Empirical Results and Benchmarks
 
-### 11.1 Methodology
+### 12.1 Methodology
 Test environment and harness:
 
 1. Local loopback baseline (127.0.0.1) to isolate protocol behavior from ISP variance.
@@ -158,7 +184,7 @@ Rationale for profile-driven stress testing:
 1. Named profiles map benchmark behavior to recognizable real-world network regimes.
 2. This improves reproducibility and interpretability compared to random parameter sweeps alone.
 
-### 11.2 Test 1: Survivability Curve (Data Plane)
+### 12.2 Test 1: Survivability Curve (Data Plane)
 Figure:
 
 ![Survivability Curve](./charts/survivability_curve.png)
@@ -175,7 +201,7 @@ Comparative note:
 1. Under equivalent sustained loss, classic congestion-window-driven TCP flows tend to sharply reduce effective throughput and may trigger timeout-driven stalls.
 2. Velyx data-plane coding strategy prioritizes recovery continuity over strict in-order retransmission.
 
-### 11.3 Test 2: AllFrames Stress Test (Control-Plane Reliability)
+### 12.3 Test 2: AllFrames Stress Test (Control-Plane Reliability)
 Figure:
 
 ![AllFrames Stress Test](./charts/allframes_stress.png)
@@ -194,15 +220,15 @@ Interpretation summary:
 3. Aggregate close-handshake success (initiator_ok and responder_ok): [INSERT_ALLFRAMES_CLOSE_SUCCESS_RATE].
 4. Worst-profile close success (starlink_storm): [INSERT_STARLINK_STORM_CLOSE_SUCCESS].
 
-### 11.4 Key Findings
+### 12.4 Key Findings
 1. Velyx demonstrates graceful degradation under rising data-plane loss.
 2. Control-plane reliability remains intact under mixed loss, jitter, and reorder when using retransmit backoff.
 3. The benchmark pipeline is reproducible end-to-end from binary run to chart generation.
 
-## 12. Open Questions
+## 13. Open Questions
 1. Which obfuscation profiles are safest under modern DPI heuristics?
 2. Should relay incentives be protocol-native or application-level?
 3. Which post-quantum transition schedule minimizes deployment risk?
 
-## 13. Conclusion
+## 14. Conclusion
 Velyx aims to become a practical open P2P standard optimized for adversarial network realities: secure by default, resilient under churn, and incrementally evolvable.

@@ -1,97 +1,94 @@
 # Velyx Protocol
 
-Velyx is a next-generation open P2P protocol built for hostile network realities: secure by default, negotiation-driven, and engineered for cross-implementation interoperability.
+![Status](https://img.shields.io/badge/status-active%20development-orange)
+![Rust](https://img.shields.io/badge/rust-2024%20edition-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0--only-blue)
 
-If you want a protocol that is not just a codebase but a future standard, this is that project.
+**A censorship-resilient, fountain-encoded peer-to-peer protocol for hostile networks.**
 
-## Why Velyx
-1. Cryptography first: Noise XX handshake + encrypted transport mode.
-2. Explicit wire contract: deterministic binary framing with strict validation.
-3. Real interoperability path: published VEP standards and test vectors.
-4. Upgrade-friendly design: version ranges and capability negotiation.
-5. Anti-fragile roadmap: replay protection, ACK semantics, and extensible registries.
+Velyx is a Rust-based P2P network stack designed for privacy-sensitive and loss-prone environments. It combines authenticated Noise handshakes, deterministic wire framing, and fountain-coded data delivery to keep sessions moving when conventional P2P systems stall.
 
-## Project Highlights
-1. Language: Rust.
-2. Security baseline: Ed25519 identities and Noise_XX_25519_ChaChaPoly_BLAKE2s.
-3. Formal docs: Whitepaper + VEP-001/002/003.
-4. Interop tests: stable vectors for wire and negotiation payloads.
+---
 
-## Standards Track
-1. VEP-001: Wire format and capability negotiation.
-2. VEP-002: Capability bit registry.
-3. VEP-003: Error codes and ACK semantics.
-4. VEP-004: Session state machine and lifecycle semantics.
+## The Whitepaper
 
-## Session Lifecycle
-```mermaid
-stateDiagram-v2
-	[*] --> Idle
-	Idle --> WaitHs1: responder start
-	Idle --> WaitHs2: initiator send HS1
-	WaitHs1 --> WaitHs3: recv HS1 + send HS2
-	WaitHs2 --> Secure: recv HS2 + send HS3
-	WaitHs3 --> Secure: recv HS3
-	Secure --> Secure: DATA/ACK/CONTROL
-	Secure --> Closing: fatal error or close
-	Closing --> Closed: timeout or close ack
-	Closed --> [*]
-```
+For the full protocol model, threat assumptions, and benchmark narrative, read the whitepaper:
 
-## Repository Layout
-1. src/main.rs: MVP node (initiator/responder) runtime.
-2. src/lib.rs: protocol primitives (wire packet, replay window, negotiation structs).
-3. tests/interop.rs: interoperability tests.
-4. test_vectors/wire_vectors.json: canonical vectors.
-5. WHITEPAPER.md: architecture and long-term direction.
-6. VEP-001.md, VEP-002.md, VEP-003.md: normative drafts.
+👉 [Velyx Whitepaper](./WHITEPAPER.md)
 
-## Quick Start
+---
+
+## The Problem
+
+Legacy P2P stacks still fail in the places modern users actually live:
+
+1. DPI and ISP filtering can identify plaintext handshakes and routing traffic.
+2. Rare-piece availability can collapse a transfer when one peer disappears.
+3. Lossy, jittery links make ARQ-heavy protocols degrade sharply under pressure.
+4. Ad hoc extensions make interoperability and upgrades difficult to reason about.
+
+## The Solution
+
+Velyx rebuilds the stack around three core ideas:
+
+* **Infinite Swarm Dynamics (RaptorQ):** data is sent as coded symbols instead of fixed file pieces, so receivers recover from any sufficient subset.
+* **Noise_XX handshakes:** the transport is encrypted from the first packet, with identity and capability negotiation folded into a compact secure channel setup.
+* **VWP framing:** a custom UDP wire protocol provides explicit packet types, session state, replay protection, and control-channel teardown semantics.
+
+## Benchmarks
+
+Velyx includes a benchmark harness and chaotic network profiles to measure survivability under loss, reorder, jitter, and teardown stress.
+
+![Survivability Curve](./charts/survivability_curve.png)
+
+![AllFrames Stress Test](./charts/allframes_stress.png)
+
+Velyx is built to finish sessions where TCP would time out or stall.
+
+## Getting Started
+
 Requirements:
 
-1. Rust toolchain (stable).
+1. Rust stable toolchain.
+2. Python 3.8+ for chart generation.
 
 Build and test:
 
-1. cargo check
-2. cargo test
+1. `cargo check`
+2. `cargo test`
 
-Run responder:
+Run a benchmark matrix:
 
-1. cargo run -- responder 0.0.0.0:9000
+1. `cargo run --release -- benchmark whitepaper_benchmarks.csv --payload-bytes 262144`
 
-Run initiator:
+Generate charts:
 
-1. cargo run -- initiator 0.0.0.0:0 127.0.0.1:9000
+1. `python scripts/plot_benchmarks.py --input whitepaper_benchmarks.csv --outdir charts`
 
-Expected result:
+## Documentation
 
-1. Successful secure handshake.
-2. Negotiated version/capabilities printed in logs.
-3. Encrypted ping/pong exchange completed.
+📚 [Read the Velyx Whitepaper](./WHITEPAPER.md)
 
-## Vision
-Velyx is designed to become a global, open, developer-owned protocol standard.
+## Roadmap
 
-Not a closed product.
-Not security by obscurity.
-A transparent protocol with rigorous drafts, test vectors, and reproducible behavior.
+Planned work on the path to 1.0:
 
-## Author
-mjojo (https://github.com/GLK-Dev)
+1. Kademlia DHT integration for decentralized peer discovery.
+2. WebRTC and QUIC-oriented pluggable transport modes.
+3. Stronger obfuscation profiles for DPI-heavy environments.
+4. More benchmark profiles and interop vectors.
 
 ## Contributing
-Contributions are welcome in three lanes:
 
-1. Security review and cryptographic analysis.
-2. Alternative client implementations for interop testing.
-3. VEP proposals for protocol evolution.
+Contributions are welcome from network engineers, cryptographers, and Rust developers.
 
-When proposing protocol changes, include:
+Useful contributions include:
 
-1. Wire-level impact.
-2. Backward-compatibility analysis.
-3. Test vectors and test updates.
+1. Security review and protocol analysis.
+2. Interoperability testing and alternate implementations.
+3. Benchmark profiles, charts, and reproducibility improvements.
+4. VEP drafts and wire-level compatibility proposals.
 
 ## License
-GPL-3.0-only. See LICENSE.
+
+GPL-3.0-only. See [LICENSE](./LICENSE).
