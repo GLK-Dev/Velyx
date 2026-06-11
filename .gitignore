@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs and runtime temp
+*.log
+*.tmp
+*.temp
+
+# Coverage and profiling
+coverage/
+*.profraw
+*.profdata
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual envs (for tooling scripts)
+.venv/
+venv/
+
+# Node tooling cache (if docs/site tooling is added later)
+node_modules/

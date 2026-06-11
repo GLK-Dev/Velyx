@@ -1,0 +1,29 @@
+{
+  "wire_packets": [
+    {
+      "name": "data_basic",
+      "hex": "564c595801100000010203040506070800000000000000010000000576656c7978",
+      "version": 1,
+      "packet_type": 16,
+      "flags": 0,
+      "session_id": 72623859790382856,
+      "seq": 1,
+      "payload_hex": "76656c7978"
+    },
+    {
+      "name": "hs1_empty_payload",
+      "hex": "564c595801010000aabbccddeeff0011000000000000000000000000",
+      "version": 1,
+      "packet_type": 1,
+      "flags": 0,
+      "session_id": 12302652060662169617,
+      "seq": 0,
+      "payload_hex": ""
+    }
+  ],
+  "capability_vectors": {
+    "client_hello_hex": "0101000000000000000f",
+    "server_hello_hex": "0101000000000000000d010000000000000005",
+    "client_finish_hex": "010000000000000005"
+  }
+}

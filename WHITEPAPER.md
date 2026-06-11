@@ -1,5 +1,7 @@
 # Velyx Protocol Whitepaper (Draft v0.1)
 
+Author: mjojo (https://github.com/GLK-Dev)
+
 ## Abstract
 Velyx is a censorship-resilient, privacy-first, and high-availability P2P protocol intended for global open standardization.
 The protocol combines modern authenticated encryption, metadata minimization, and erasure/fountain-style data coding to improve survivability and transfer continuity under adversarial network conditions.
@@ -42,11 +44,54 @@ Velyx does not assume trusted infrastructure and should remain useful with parti
 4. Data Plane Layer: chunk graph + fountain/FEC extension.
 5. Control Plane Layer: session management, capability negotiation, and versioning.
 
+## 4.1 Formal Wire Format (V1)
+Binary packet format (network byte order / big-endian):
+
+1. magic[4]: ASCII VLYX.
+2. version[1]: protocol version (current 1).
+3. packet_type[1]: 1=HS1, 2=HS2, 3=HS3, 16=DATA, 17=ACK, 18=CONTROL, 19=KEEPALIVE, 255=ERROR.
+4. flags[2]: reserved for extensions.
+5. session_id[8]: session scope identifier.
+6. seq[8]: monotonically increasing per-direction packet counter.
+7. payload_len[4]: payload byte length.
+8. payload[N]: type-specific content.
+
+Wire invariant rules:
+
+1. Receiver must validate magic/version/type before payload parsing.
+2. Receiver must enforce exact payload length match.
+3. session_id must remain constant across one negotiated session.
+
+Nonce and sequence rules:
+
+1. seq starts from 0 independently in each direction.
+2. seq increments by exactly 1 for each next packet sent by that direction.
+3. seq is used as anti-replay counter and future nonce-derivation input for custom AEAD modes.
+
+Replay protection:
+
+1. Sliding acceptance window of 128 sequence numbers.
+2. Duplicate seq is rejected.
+3. Too-old seq outside the window is rejected.
+
 ## 5. Cryptography
 1. Session handshake: Noise_XX_25519_ChaChaPoly_BLAKE2s (MVP baseline).
 2. Node identity: Ed25519 public key as stable peer identity.
 3. Forward secrecy: ephemeral DH in each session handshake.
 4. Roadmap: post-quantum hybrid KEM option (e.g., Kyber + X25519).
+
+## 5.1 Capability Negotiation
+Handshake payloads carry explicit capability and version ranges:
+
+1. ClientHello: min_version, max_version, capability_mask.
+2. ServerHello: server min/max/mask plus selected_version and selected_mask.
+3. ClientFinish: selected_version and selected_mask echo confirmation.
+
+Selection algorithm:
+
+1. version = highest shared version inside both ranges.
+2. capabilities = bitwise intersection of both masks.
+3. If no version overlap exists, handshake fails.
 
 ## 6. Data Dissemination and Integrity
 Velyx roadmap introduces a fountain/FEC mode for swarm resilience:
@@ -70,12 +115,16 @@ This removes strict dependence on rare block availability and improves recovery 
 1. Open-source reference implementation (Rust) under copyleft or dual-license model.
 2. VEP process (Velyx Enhancement Proposals).
 3. Security audits, reproducible builds, and interop test vectors.
+4. Initial normative draft: VEP-001 (wire format and capability negotiation).
 
 ## 9. MVP Scope (Current Implementation)
 1. Peer ID generation (Ed25519).
 2. UDP socket communication.
-3. Noise XX handshake between initiator and responder.
-4. Encrypted ping/pong exchange after handshake.
+3. Formal wire framing (header, type tags, version field, session_id, seq).
+4. Replay protection with sliding sequence window.
+5. Noise XX handshake between initiator and responder.
+6. Capability negotiation during handshake payload exchange.
+7. Encrypted ping/pong exchange after handshake.
 
 ## 10. Milestones
 1. M1: handshake + encrypted transport baseline.
