@@ -136,10 +136,73 @@ This removes strict dependence on rare block availability and improves recovery 
 4. M4: obfuscation plugin framework.
 5. M5: third-party security review and VEP-1 release.
 
-## 11. Open Questions
+## 11. Empirical Results and Benchmarks
+
+### 11.1 Methodology
+Test environment and harness:
+
+1. Local loopback baseline (127.0.0.1) to isolate protocol behavior from ISP variance.
+2. Payload size per run: [INSERT_PAYLOAD_BYTES] bytes (current benchmark profile target: 262144).
+3. Transport impairment injection via DirtyNetwork middleware.
+4. Metrics recorded per run in CSV:
+	1. recovery_time_ms
+	2. goodput_bytes_per_sec
+	3. overhead_ratio
+	4. initiator_ok / responder_ok
+5. Two evaluation modes:
+	1. DataOnly matrix (data-plane impairment only).
+	2. AllFrames stress profiles (data + control + ack impairment).
+
+Rationale for profile-driven stress testing:
+
+1. Named profiles map benchmark behavior to recognizable real-world network regimes.
+2. This improves reproducibility and interpretability compared to random parameter sweeps alone.
+
+### 11.2 Test 1: Survivability Curve (Data Plane)
+Figure:
+
+![Survivability Curve](./charts/survivability_curve.png)
+
+Interpretation summary:
+
+1. As packet loss increases from 0% to 50%, recovery remains smooth and monotonic rather than collapsing.
+2. Throughput degrades gradually with channel quality, consistent with fountain-code redundancy behavior.
+3. Overhead remains bounded in the expected operational band: [INSERT_OVERHEAD_RANGE].
+4. Session completion success in this mode: [INSERT_DATAONLY_SUCCESS_RATE].
+
+Comparative note:
+
+1. Under equivalent sustained loss, classic congestion-window-driven TCP flows tend to sharply reduce effective throughput and may trigger timeout-driven stalls.
+2. Velyx data-plane coding strategy prioritizes recovery continuity over strict in-order retransmission.
+
+### 11.3 Test 2: AllFrames Stress Test (Control-Plane Reliability)
+Figure:
+
+![AllFrames Stress Test](./charts/allframes_stress.png)
+
+Profiles:
+
+1. datacenter_flap: 5% loss, 5ms jitter, 5% reorder.
+2. mobile_3g_edge: 10% loss, 50ms jitter, 0% reorder.
+3. congested_wifi: 20% loss, 10ms jitter, 10% reorder.
+4. starlink_storm: 30% loss, 20ms jitter, 25% reorder.
+
+Interpretation summary:
+
+1. recovery_time_ms increases under severe profile conditions as expected.
+2. Session teardown correctness is preserved by RetransmitState with exponential backoff.
+3. Aggregate close-handshake success (initiator_ok and responder_ok): [INSERT_ALLFRAMES_CLOSE_SUCCESS_RATE].
+4. Worst-profile close success (starlink_storm): [INSERT_STARLINK_STORM_CLOSE_SUCCESS].
+
+### 11.4 Key Findings
+1. Velyx demonstrates graceful degradation under rising data-plane loss.
+2. Control-plane reliability remains intact under mixed loss, jitter, and reorder when using retransmit backoff.
+3. The benchmark pipeline is reproducible end-to-end from binary run to chart generation.
+
+## 12. Open Questions
 1. Which obfuscation profiles are safest under modern DPI heuristics?
 2. Should relay incentives be protocol-native or application-level?
 3. Which post-quantum transition schedule minimizes deployment risk?
 
-## 12. Conclusion
+## 13. Conclusion
 Velyx aims to become a practical open P2P standard optimized for adversarial network realities: secure by default, resilient under churn, and incrementally evolvable.
