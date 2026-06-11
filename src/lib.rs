@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 
 pub mod stream;
+pub mod dht;
 
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"VLYX";
 pub const PROTOCOL_VERSION: u8 = 1;
