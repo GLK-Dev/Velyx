@@ -1,0 +1,2 @@
+run_id,loss_pct,jitter_ms,reorder_pct,initiator_ok,responder_ok,end_to_end_ms,recovery_time_ms,goodput_bytes_per_sec,overhead_ratio,data_frames_dropped,data_frames_duplicated,data_frames_reordered
+1,0,0,0,false,true,164584,6803,38533.59,1.0000,0,0,0

@@ -2,8 +2,11 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, timeout};
 use velyx::{
@@ -19,6 +22,20 @@ use velyx::stream::{
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SessionState {
+    Active,
+    Closing,
+    Closed,
+}
+
+struct RetransmitState {
+    stop_stream_chunk: Vec<u8>,
+    attempt: u32,
+    next_retry_at: std::time::Instant,
+    initial_close_time: std::time::Instant,
+}
+
 struct PeerSession {
     session_id: u64,
     negotiated: Negotiated,
@@ -31,24 +48,36 @@ struct PeerSession {
     stream_receiver: StreamReceiver,
     reorder_hold: Option<VwpFrame>,
     telemetry: StreamTelemetry,
+    state: SessionState,
+    retransmit: Option<RetransmitState>,
 }
 
 struct ResponderOptions {
     chaos: Option<ChaosConfig>,
     metrics_csv: Option<String>,
+    stop_after_streams: Option<u32>,
+}
+
+struct InitiatorOptions {
+    payload_size_bytes: usize,
+}
+
+struct BenchmarkOptions {
+    output_csv: String,
+    max_runs: Option<u32>,
+    payload_size_bytes: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 3 {
+    if args.len() < 2 {
         print_usage();
-        bail!("not enough arguments");
+        bail!("missing mode argument");
     }
 
     let mode = args[1].as_str();
-    let bind_addr = args[2].as_str();
 
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
@@ -58,19 +87,43 @@ async fn main() -> Result<()> {
 
     match mode {
         "responder" => {
+            if args.len() < 3 {
+                print_usage();
+                bail!("responder mode needs bind address");
+            }
+            let bind_addr = args[2].as_str();
             let opts = parse_responder_options(&args)?;
             let chaos_middleware = match opts.chaos {
                 Some(cfg) => Some(DirtyNetwork::new(cfg, 0xC0FFEE)?),
                 None => None,
             };
-            run_responder(bind_addr, chaos_middleware, opts.metrics_csv).await
+            run_responder(
+                bind_addr,
+                chaos_middleware,
+                opts.metrics_csv,
+                opts.stop_after_streams,
+            )
+            .await
         }
         "initiator" => {
             if args.len() < 4 {
                 print_usage();
                 bail!("initiator mode needs a remote address");
             }
-            run_initiator(bind_addr, args[3].as_str()).await
+            let bind_addr = args[2].as_str();
+            run_initiator(
+                bind_addr,
+                args[3].as_str(),
+                InitiatorOptions {
+                    payload_size_bytes: 80 * 135,
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        "benchmark" => {
+            let opts = parse_benchmark_options(&args)?;
+            run_benchmark_matrix(&opts).await
         }
         _ => {
             print_usage();
@@ -83,12 +136,61 @@ fn print_usage() {
     println!("Usage:");
     println!("  velyx responder <bind_addr> [chaos flags]");
     println!("  velyx initiator <bind_addr> <remote_addr>");
+    println!("  velyx benchmark [output_csv] [--max-runs N] [--payload-bytes N]");
     println!("Examples:");
     println!("  velyx responder 0.0.0.0:9000");
     println!("  velyx responder 0.0.0.0:9000 --chaos-drop-data-pct 30");
     println!("  velyx responder 0.0.0.0:9000 --chaos-scope all --chaos-jitter-ms 20 --chaos-reorder-pct 10");
     println!("  velyx responder 0.0.0.0:9000 --metrics-csv ./metrics.csv --chaos-drop-data-pct 30");
     println!("  velyx initiator 0.0.0.0:0 127.0.0.1:9000");
+    println!("  velyx benchmark ./whitepaper_benchmarks.csv");
+    println!("  velyx benchmark ./whitepaper_benchmarks.csv --max-runs 1 --payload-bytes 262144");
+}
+
+fn parse_benchmark_options(args: &[String]) -> Result<BenchmarkOptions> {
+    let mut output_csv = "whitepaper_benchmarks.csv".to_string();
+    let mut max_runs = None;
+    let mut payload_size_bytes = 1024 * 1024;
+
+    let mut i = 2;
+    if i < args.len() && !args[i].starts_with("--") {
+        output_csv = args[i].clone();
+        i += 1;
+    }
+
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            print_usage();
+            bail!("missing value for option: {}", args[i]);
+        }
+
+        match args[i].as_str() {
+            "--max-runs" => {
+                max_runs = Some(
+                    args[i + 1]
+                        .parse()
+                        .with_context(|| format!("invalid --max-runs value: {}", args[i + 1]))?,
+                );
+            }
+            "--payload-bytes" => {
+                payload_size_bytes = args[i + 1]
+                    .parse()
+                    .with_context(|| format!("invalid --payload-bytes value: {}", args[i + 1]))?;
+            }
+            other => {
+                print_usage();
+                bail!("unknown benchmark option: {other}");
+            }
+        }
+
+        i += 2;
+    }
+
+    Ok(BenchmarkOptions {
+        output_csv,
+        max_runs,
+        payload_size_bytes,
+    })
 }
 
 fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
@@ -96,6 +198,7 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
         return Ok(ResponderOptions {
             chaos: None,
             metrics_csv: None,
+            stop_after_streams: None,
         });
     }
 
@@ -160,6 +263,7 @@ fn parse_responder_options(args: &[String]) -> Result<ResponderOptions> {
     Ok(ResponderOptions {
         chaos: Some(cfg.validate()?),
         metrics_csv,
+        stop_after_streams: None,
     })
 }
 
@@ -190,6 +294,7 @@ async fn run_responder(
     bind_addr: &str,
     mut chaos: Option<DirtyNetwork>,
     metrics_csv: Option<String>,
+    stop_after_streams: Option<u32>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(bind_addr)
         .await
@@ -201,37 +306,41 @@ async fn run_responder(
     let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
+    let mut completed_streams = 0u32;
 
     loop {
-        let (len, remote) = socket
-            .recv_from(&mut in_buf)
-            .await
-            .context("failed to receive UDP datagram")?;
+        let recv_result = timeout(
+            Duration::from_millis(50),
+            socket.recv_from(&mut in_buf),
+        )
+        .await;
 
-        let packet = match WirePacket::decode(&in_buf[..len]) {
-            Ok(packet) => packet,
-            Err(err) => {
-                println!("Dropping invalid packet from {remote}: {err}");
-                continue;
-            }
-        };
+        match recv_result {
+            Ok(Ok((len, remote))) => {
+                let packet = match WirePacket::decode(&in_buf[..len]) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        println!("Dropping invalid packet from {remote}: {err}");
+                        continue;
+                    }
+                };
 
-        if packet.version != PROTOCOL_VERSION {
-            println!(
-                "Dropping packet from {remote}: unsupported version {}",
-                packet.version
-            );
-            continue;
-        }
+                if packet.version != PROTOCOL_VERSION {
+                    println!(
+                        "Dropping packet from {remote}: unsupported version {}",
+                        packet.version
+                    );
+                    continue;
+                }
 
-        if let Some(session) = peers.get_mut(&remote) {
-            if packet.session_id != session.session_id {
-                println!(
-                    "Dropping packet from {remote}: session mismatch got {}, expected {}",
-                    packet.session_id, session.session_id
-                );
-                continue;
-            }
+                if let Some(session) = peers.get_mut(&remote) {
+                    if packet.session_id != session.session_id {
+                        println!(
+                            "Dropping packet from {remote}: session mismatch got {}, expected {}",
+                            packet.session_id, session.session_id
+                        );
+                        continue;
+                    }
 
             if let Err(err) = session.recv_replay.check_and_record(packet.seq) {
                 println!("Dropping replay/out-of-window packet from {remote}: {err}");
@@ -484,7 +593,21 @@ async fn run_responder(
                     }
                 }
                 VwpFrameType::Ack => {
-                    println!("[{remote}] Received ACK frame on responder side");
+                    let ack = match ControlAck::decode(&vwp.payload) {
+                        Ok(ack) => ack,
+                        Err(err) => {
+                            println!("[{remote}] Failed to decode ACK: {err}");
+                            continue;
+                        }
+                    };
+                    println!("[{remote}] Received ACK: message_id={}, chunk_index={}", ack.message_id, ack.chunk_index);
+
+                    // If we're Closing and receive an ACK for STOP_STREAM (message_id=2), move to Closed
+                    if session.state == SessionState::Closing && ack.message_id == 2 {
+                        println!("[{remote}] Received ACK for STOP_STREAM, moving to Closed");
+                        session.state = SessionState::Closed;
+                        session.retransmit = None;
+                    }
                 }
                 VwpFrameType::Data => {
                     match session.stream_receiver.ingest_data_packet(&vwp.payload) {
@@ -507,11 +630,21 @@ async fn run_responder(
                             }
                         }
 
+                        completed_streams = completed_streams.saturating_add(1);
+                        if let Some(limit) = stop_after_streams
+                            && completed_streams >= limit
+                        {
+                            println!("Responder reached stop-after-streams limit: {limit}");
+                            return Ok(());
+                        }
+
+                        // Transition to Closing state and prepare STOP_STREAM for reliable retransmit.
+                        let stop_chunk_payload = StreamCommand::StopStream.encode();
                         let stop_frames = match chunk_control_message(
                             vwp.stream_id,
                             2,
                             session.vwp_tx_seq,
-                            &StreamCommand::StopStream.encode(),
+                            &stop_chunk_payload,
                         ) {
                             Ok(frames) => frames,
                             Err(err) => {
@@ -520,83 +653,38 @@ async fn run_responder(
                             }
                         };
 
-                        for frame in stop_frames {
-                            session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
-                            let raw = match frame.encode() {
-                                Ok(raw) => raw,
+                        // Encode first STOP_STREAM frame for retransmit storage.
+                        let stop_wire_payload = if let Some(frame) = stop_frames.first() {
+                            match frame.encode() {
+                                Ok(raw) => {
+                                    match transport.write_message(&raw, &mut out_buf) {
+                                        Ok(len) => out_buf[..len].to_vec(),
+                                        Err(err) => {
+                                            println!("Failed to encrypt STOP_STREAM frame: {err}");
+                                            continue;
+                                        }
+                                    }
+                                }
                                 Err(err) => {
                                     println!("Failed to encode STOP_STREAM VWP frame: {err}");
-                                    break;
-                                }
-                            };
-                            let wire_len = match transport.write_message(&raw, &mut out_buf) {
-                                Ok(len) => len,
-                                Err(err) => {
-                                    println!("Failed to encrypt STOP_STREAM frame: {err}");
-                                    break;
-                                }
-                            };
-                            let pkt = WirePacket {
-                                version: PROTOCOL_VERSION,
-                                packet_type: PacketType::Data,
-                                flags: 0,
-                                session_id: session.session_id,
-                                seq: session.tx_seq,
-                                payload: out_buf[..wire_len].to_vec(),
-                            };
-                            session.tx_seq += 1;
-                            let pkt_raw = match pkt.encode() {
-                                Ok(raw) => raw,
-                                Err(err) => {
-                                    println!("Failed to encode STOP_STREAM packet: {err}");
-                                    break;
-                                }
-                            };
-                            if let Err(err) = socket.send_to(&pkt_raw, remote).await {
-                                println!("Failed to send STOP_STREAM packet to {remote}: {err}");
-                                break;
-                            }
-                        }
-
-                        let data_frame = VwpFrame {
-                            frame_type: VwpFrameType::Data,
-                            seq: session.vwp_tx_seq,
-                            stream_id: vwp.stream_id,
-                            payload: b"velyx-pong".to_vec(),
-                        };
-                        session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
-                        let data_wire_len = match data_frame.encode() {
-                            Ok(bytes) => match transport.write_message(&bytes, &mut out_buf) {
-                                Ok(n) => n,
-                                Err(err) => {
-                                    println!("Failed to encrypt data reply for {remote}: {err}");
                                     continue;
                                 }
-                            },
-                            Err(err) => {
-                                println!("Failed to encode VWP data reply for {remote}: {err}");
-                                continue;
                             }
+                        } else {
+                            continue;
                         };
-                        let reply_packet = WirePacket {
-                            version: PROTOCOL_VERSION,
-                            packet_type: PacketType::Data,
-                            flags: 0,
-                            session_id: session.session_id,
-                            seq: session.tx_seq,
-                            payload: out_buf[..data_wire_len].to_vec(),
-                        };
-                        session.tx_seq += 1;
-                        let reply_raw = match reply_packet.encode() {
-                            Ok(raw) => raw,
-                            Err(err) => {
-                                println!("Failed to encode data reply packet for {remote}: {err}");
-                                continue;
-                            }
-                        };
-                        if let Err(err) = socket.send_to(&reply_raw, remote).await {
-                            println!("Failed to send data reply to {remote}: {err}");
-                        }
+
+                        // Move to Closing state with retransmit setup.
+                        session.state = SessionState::Closing;
+                        session.retransmit = Some(RetransmitState {
+                            stop_stream_chunk: stop_wire_payload,
+                            attempt: 1,
+                            next_retry_at: std::time::Instant::now(),
+                            initial_close_time: std::time::Instant::now(),
+                        });
+                        println!("[{remote}] Transitioned to Closing state, will retransmit STOP_STREAM with backoff");
+
+                        session.vwp_tx_seq = session.vwp_tx_seq.wrapping_add(1);
                         }
                         Ok(None) => {
                             session.telemetry.on_data_ingested();
@@ -607,123 +695,99 @@ async fn run_responder(
                     }
                 }
             }
+            }  // close for vwp in frames_to_process
+            }  // close if let Some(session)
+        }
+        Ok(Err(err)) => {
+            println!("UDP recv_from error: {err}");
+        }
+        Err(_) => {
+            // Timeout on recv, handle retransmits
+        }
+    } // close match recv_result
+
+        // Handle retransmits for Closing sessions
+        let now = std::time::Instant::now();
+        let mut to_remove = Vec::new();
+        for (peer_addr, session) in peers.iter_mut() {
+            // Clean up Closed sessions
+            if session.state == SessionState::Closed {
+                to_remove.push(*peer_addr);
+                continue;
             }
-            continue;
+
+            if session.state != SessionState::Closing {
+                continue;
+            }
+
+            let Some(retransmit) = session.retransmit.as_mut() else {
+                continue;
+            };
+
+            let elapsed_since_close = now.duration_since(retransmit.initial_close_time);
+            if elapsed_since_close > Duration::from_secs(5) {
+                println!("[{peer_addr}] Hard timeout after 5 seconds in Closing state");
+                to_remove.push(*peer_addr);
+                continue;
+            }
+
+            if retransmit.attempt > 10 {
+                println!("[{peer_addr}] Max retransmit attempts (10) reached, giving up");
+                to_remove.push(*peer_addr);
+                continue;
+            }
+
+            if now < retransmit.next_retry_at {
+                continue;
+            }
+
+            // Calculate exponential backoff: 50ms * (1.5 ^ (attempt - 1)), capped at 300ms
+            let base_ms = 50u64;
+            let backoff_ms = if retransmit.attempt == 1 {
+                base_ms
+            } else {
+                let exp = (retransmit.attempt - 1) as f64;
+                let ms = (base_ms as f64 * 1.5_f64.powf(exp)) as u64;
+                ms.min(300)
+            };
+
+            let pkt = WirePacket {
+                version: PROTOCOL_VERSION,
+                packet_type: PacketType::Data,
+                flags: 0,
+                session_id: session.session_id,
+                seq: session.tx_seq,
+                payload: retransmit.stop_stream_chunk.clone(),
+            };
+            session.tx_seq += 1;
+
+            if let Ok(raw) = pkt.encode() {
+                if let Err(err) = socket.send_to(&raw, peer_addr).await {
+                    println!("[{peer_addr}] Failed to retransmit STOP_STREAM: {err}");
+                } else {
+                    println!(
+                        "[{peer_addr}] Retransmit STOP_STREAM #{} (backoff in {backoff_ms}ms)",
+                        retransmit.attempt
+                    );
+                }
+            }
+
+            retransmit.attempt += 1;
+            retransmit.next_retry_at = now + Duration::from_millis(backoff_ms);
         }
 
-        if packet.packet_type != PacketType::Handshake1 {
-            println!(
-                "Dropping packet from unknown peer {remote}: expected Handshake1, got {:?}",
-                packet.packet_type
-            );
-            continue;
+        for addr in to_remove {
+            println!("[{addr}] Removing Closing session");
+            peers.remove(&addr);
         }
-
-        let params: NoiseParams = match NOISE_PATTERN.parse() {
-            Ok(params) => params,
-            Err(err) => {
-                println!("Failed to parse noise pattern for new peer {remote}: {err}");
-                continue;
-            }
-        };
-
-        let mut hs = match Builder::new(params)
-            .local_private_key(&static_key)
-            .build_responder()
-        {
-            Ok(state) => state,
-            Err(err) => {
-                println!("Failed to build responder state for {remote}: {err}");
-                continue;
-            }
-        };
-
-        let mut recv_replay = ReplayWindow::default();
-        if let Err(err) = recv_replay.check_and_record(packet.seq) {
-            println!("Invalid initial sequence from {remote}: {err}");
-            continue;
-        }
-
-        let hello_len = match hs.read_message(&packet.payload, &mut out_buf) {
-            Ok(len) => len,
-            Err(err) => {
-                println!("Failed handshake message 1 from {remote}: {err}");
-                continue;
-            }
-        };
-        let remote_hello = match ClientHello::decode(&out_buf[..hello_len]) {
-            Ok(hello) => hello,
-            Err(err) => {
-                println!("Invalid client hello in message 1 from {remote}: {err}");
-                continue;
-            }
-        };
-        let selected = match negotiate(local, remote_hello) {
-            Ok(negotiated) => negotiated,
-            Err(err) => {
-                println!("Negotiation failed for {remote}: {err}");
-                continue;
-            }
-        };
-
-        let hello2 = ServerHello {
-            min_version: local.min_version,
-            max_version: local.max_version,
-            caps: local.mask,
-            selected_version: selected.version,
-            selected_caps: selected.caps,
-        };
-
-        let len2 = match hs.write_message(&hello2.encode(), &mut out_buf) {
-            Ok(len) => len,
-            Err(err) => {
-                println!("Failed to write handshake message 2 for {remote}: {err}");
-                continue;
-            }
-        };
-        let hs2_packet = WirePacket {
-            version: PROTOCOL_VERSION,
-            packet_type: PacketType::Handshake2,
-            flags: 0,
-            session_id: packet.session_id,
-            seq: 0,
-            payload: out_buf[..len2].to_vec(),
-        };
-        let hs2_raw = match hs2_packet.encode() {
-            Ok(raw) => raw,
-            Err(err) => {
-                println!("Failed to encode handshake message 2 for {remote}: {err}");
-                continue;
-            }
-        };
-        if let Err(err) = socket.send_to(&hs2_raw, remote).await {
-            println!("Failed to send handshake message 2 to {remote}: {err}");
-            continue;
-        }
-
-        peers.insert(
-            remote,
-            PeerSession {
-                session_id: packet.session_id,
-                negotiated: selected,
-                recv_replay,
-                tx_seq: 1,
-                vwp_tx_seq: 0,
-                handshake: Some(hs),
-                transport: None,
-                control_assembler: ControlAssembler::default(),
-                stream_receiver: StreamReceiver::default(),
-                reorder_hold: None,
-                telemetry: StreamTelemetry::default(),
-            },
-        );
-
-        println!("Handshake msg1 received from {remote}");
-        println!("Active peer sessions: {}", peers.len());
     }
 }
 
-async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
+async fn run_initiator(
+    bind_addr: &str,
+    remote_addr: &str,
+    options: InitiatorOptions,
+) -> Result<bool> {
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind initiator socket on {bind_addr}"))?;
@@ -830,8 +894,13 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
     let mut stream_id = [0u8; VWP_STREAM_ID_LEN];
     stream_id[0..8].copy_from_slice(&session_id.to_be_bytes());
 
-    let data_blob = b"velyx fountain stream payload for MVP demo. this data is intentionally repeated to exceed one symbol size and validate decode behavior."
-        .repeat(80);
+    let pattern = b"velyx benchmark stream payload block ";
+    let repeats = options.payload_size_bytes.div_ceil(pattern.len());
+    let mut data_blob = Vec::with_capacity(repeats * pattern.len());
+    for _ in 0..repeats {
+        data_blob.extend_from_slice(pattern);
+    }
+    data_blob.truncate(options.payload_size_bytes);
     let mut stream_sender = StreamSender::new(stream_id, &data_blob, 1300, 0, 24)?;
     let control_frames = stream_sender.stream_start_frames(1, 0)?;
     let expected_acks = control_frames.len();
@@ -862,6 +931,7 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
     let mut stop_received = false;
     let mut local_control_assembler = ControlAssembler::default();
     let mut sent_frames = 0usize;
+    let mut logged_waiting_for_stop = false;
 
     // Data frames start after control frame sequence space.
     stream_sender = StreamSender::new(stream_id, &data_blob, 1300, vwp_data_seq, 24)?;
@@ -892,12 +962,18 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
         // MVP pacing to avoid local UDP queue overflow.
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        let recv_result = timeout(Duration::from_millis(2), socket.recv_from(&mut in_buf)).await;
+        let poll_timeout = if acked_chunks >= expected_acks { 12 } else { 3 };
+        let recv_result = timeout(
+            Duration::from_millis(poll_timeout),
+            socket.recv_from(&mut in_buf),
+        )
+        .await;
         let Ok(Ok((resp_len, from3))) = recv_result else {
-            if sent_frames > 1000 && acked_chunks >= expected_acks {
-                println!("No STOP_STREAM yet, continuing fire-and-forget stream...");
+            if sent_frames > 1200 && acked_chunks >= expected_acks && !logged_waiting_for_stop {
+                println!("Waiting for STOP_STREAM after full control ACK coverage");
+                logged_waiting_for_stop = true;
             }
-            if sent_frames > 10000 {
+            if sent_frames > 6000 {
                 println!("MVP safety break after extended streaming window");
                 break;
             }
@@ -972,8 +1048,9 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
                 if let Some(full) = assembled {
                     match StreamCommand::decode(&full) {
                         Ok(StreamCommand::StopStream) => {
-                            println!("Received STOP_STREAM from responder");
+                            println!("Received STOP_STREAM from responder, gracefully shutting down");
                             stop_received = true;
+                            break;
                         }
                         Ok(StreamCommand::StreamStart(_)) => {
                             println!("Received unexpected STREAM_START from responder");
@@ -991,6 +1068,214 @@ async fn run_initiator(bind_addr: &str, remote_addr: &str) -> Result<()> {
         }
     }
 
+    Ok(stop_received)
+}
+
+async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
+    let losses = [0u8, 10, 20, 30, 40, 50];
+    let jitters = [0u16, 10, 50];
+    let reorders = [0u8, 10, 25];
+
+    initialize_benchmark_csv(&options.output_csv)?;
+    let mut run_id = 0u32;
+
+    for loss in losses {
+        for jitter in jitters {
+            for reorder in reorders {
+                run_id += 1;
+                if let Some(max) = options.max_runs
+                    && run_id > max
+                {
+                    println!("Benchmark matrix stopped after max-runs={max}");
+                    println!("Partial benchmark output: {}", options.output_csv);
+                    return Ok(());
+                }
+                let port = 12000 + run_id as u16;
+                let bind_addr = format!("127.0.0.1:{port}");
+                let remote_addr = bind_addr.clone();
+                let per_run_metrics = format!("bench_run_{run_id}.csv");
+                if Path::new(&per_run_metrics).exists() {
+                    std::fs::remove_file(&per_run_metrics)
+                        .with_context(|| format!("failed to remove old file {per_run_metrics}"))?;
+                }
+
+                let chaos_cfg = ChaosConfig {
+                    drop_data_pct: loss,
+                    drop_control_pct: 0,
+                    drop_ack_pct: 0,
+                    duplicate_pct: 0,
+                    reorder_pct: reorder,
+                    jitter_ms: jitter,
+                    scope: ChaosScope::DataOnly,
+                }
+                .validate()?;
+
+                let responder = tokio::spawn({
+                    let bind_addr = bind_addr.clone();
+                    let metrics_path = per_run_metrics.clone();
+                    async move {
+                        let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xBADC0DE + run_id as u64)?);
+                        run_responder(&bind_addr, dirty, Some(metrics_path), Some(1)).await
+                    }
+                });
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let bench_started = std::time::Instant::now();
+                let initiator_result = run_initiator(
+                    "127.0.0.1:0",
+                    &remote_addr,
+                    InitiatorOptions {
+                        payload_size_bytes: options.payload_size_bytes,
+                    },
+                )
+                .await;
+
+                let initiator_ok = match initiator_result {
+                    Ok(stop_ok) => stop_ok,
+                    Err(err) => {
+                        println!("Benchmark run {run_id}: initiator error: {err}");
+                        false
+                    }
+                };
+
+                let responder_ok = match timeout(Duration::from_secs(6), responder).await {
+                    Ok(joined) => match joined {
+                        Ok(result) => result.is_ok(),
+                        Err(err) => {
+                            println!("Benchmark run {run_id}: responder join error: {err}");
+                            false
+                        }
+                    },
+                    Err(_) => {
+                        println!("Benchmark run {run_id}: responder timeout, aborting task");
+                        false
+                    }
+                };
+
+                let elapsed_ms = bench_started.elapsed().as_millis();
+                let metrics = parse_last_metrics_row(&per_run_metrics)?;
+
+                append_benchmark_row(
+                    &options.output_csv,
+                    run_id,
+                    loss,
+                    jitter,
+                    reorder,
+                    initiator_ok,
+                    responder_ok,
+                    elapsed_ms,
+                    metrics,
+                )?;
+
+                if Path::new(&per_run_metrics).exists() {
+                    let _ = std::fs::remove_file(&per_run_metrics);
+                }
+
+                println!(
+                    "Benchmark run #{run_id} completed (loss={loss} jitter={jitter} reorder={reorder})"
+                );
+            }
+        }
+    }
+
+    println!("Benchmark matrix complete. Output: {}", options.output_csv);
+    Ok(())
+}
+
+fn initialize_benchmark_csv(path: &str) -> Result<()> {
+    if Path::new(path).exists() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to create benchmark CSV: {path}"))?;
+    writeln!(
+        file,
+        "run_id,loss_pct,jitter_ms,reorder_pct,initiator_ok,responder_ok,end_to_end_ms,recovery_time_ms,goodput_bytes_per_sec,overhead_ratio,data_frames_dropped,data_frames_duplicated,data_frames_reordered"
+    )
+    .context("failed to write benchmark CSV header")?;
+    Ok(())
+}
+
+type ParsedMetrics = Option<(u128, f64, f64, u64, u64, u64)>;
+
+fn parse_last_metrics_row(path: &str) -> Result<ParsedMetrics> {
+    if !Path::new(path).exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read metrics CSV: {path}"))?;
+    let mut lines = content.lines();
+    let _header = lines.next();
+    let Some(last) = lines.last() else {
+        return Ok(None);
+    };
+
+    let parts: Vec<&str> = last.split(',').collect();
+    if parts.len() < 14 {
+        return Ok(None);
+    }
+
+    let recovery_time_ms = parts[11].parse().unwrap_or(0);
+    let goodput_bps = parts[12].parse().unwrap_or(0.0);
+    let overhead_ratio = parts[13].parse().unwrap_or(0.0);
+    let dropped = parts[7].parse().unwrap_or(0);
+    let duplicated = parts[8].parse().unwrap_or(0);
+    let reordered = parts[9].parse().unwrap_or(0);
+
+    Ok(Some((
+        recovery_time_ms,
+        goodput_bps,
+        overhead_ratio,
+        dropped,
+        duplicated,
+        reordered,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_benchmark_row(
+    path: &str,
+    run_id: u32,
+    loss_pct: u8,
+    jitter_ms: u16,
+    reorder_pct: u8,
+    initiator_ok: bool,
+    responder_ok: bool,
+    end_to_end_ms: u128,
+    metrics: ParsedMetrics,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open benchmark CSV: {path}"))?;
+
+    let (recovery_ms, goodput, overhead, dropped, duped, reordered) =
+        metrics.unwrap_or((0, 0.0, 0.0, 0, 0, 0));
+
+    writeln!(
+        file,
+        "{},{},{},{},{},{},{},{},{:.2},{:.4},{},{},{}",
+        run_id,
+        loss_pct,
+        jitter_ms,
+        reorder_pct,
+        initiator_ok,
+        responder_ok,
+        end_to_end_ms,
+        recovery_ms,
+        goodput,
+        overhead,
+        dropped,
+        duped,
+        reordered,
+    )
+    .context("failed to append benchmark CSV row")?;
     Ok(())
 }
 
