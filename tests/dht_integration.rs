@@ -43,7 +43,7 @@ fn dht_action_to_ping_pong_roundtrip_updates_both_tables() {
 
     let outbound = execute_dht_action(second_insert.actions[0], table_a.local_id())
         .expect("action should convert to outbound command");
-    assert_eq!(outbound.target_id, id_b);
+    assert_eq!(outbound.route_to, Some(id_b));
 
     let wire_ping = outbound.command.encode();
     let decoded_ping = StreamCommand::decode(&wire_ping).expect("decode ping");

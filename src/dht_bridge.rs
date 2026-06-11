@@ -4,35 +4,71 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use crate::{
     PROTOCOL_VERSION, PacketType, VWP_STREAM_ID_LEN, WirePacket, chunk_control_message,
-    dht::{NodeId, RoutingAction},
+    dht::{NodeId, RoutingAction, RoutingTable},
     stream::StreamCommand,
 };
 
 #[derive(Debug, Clone)]
 pub struct ExecutedDhtAction {
-    pub target_id: NodeId,
+    pub route_to: Option<NodeId>,
     pub command: StreamCommand,
 }
 
 pub fn execute_dht_action(action: RoutingAction, local_id: NodeId) -> Option<ExecutedDhtAction> {
     match action {
         RoutingAction::Ping(target_id) => Some(ExecutedDhtAction {
-            target_id,
+            route_to: Some(target_id),
             command: StreamCommand::Ping {
                 sender_id: local_id,
             },
         }),
+        RoutingAction::Lookup(target_id) => Some(ExecutedDhtAction {
+            route_to: None,
+            command: StreamCommand::FindNode { target_id },
+        }),
     }
 }
 
-pub fn route_action_to_command(action: RoutingAction, local_id: NodeId) -> (NodeId, StreamCommand) {
-    match action {
-        RoutingAction::Ping(target_id) => (
-            target_id,
-            StreamCommand::Ping {
-                sender_id: local_id,
-            },
-        ),
+pub fn refresh_bucket_lookup_action(
+    table: &RoutingTable,
+    bucket_index: u8,
+    entropy: u64,
+) -> RoutingAction {
+    let mut target = *table.local_id().as_bytes();
+
+    // Keep all higher bits equal to local_id and flip the bucket bit.
+    let current = get_bit_lsb(&target, bucket_index as usize);
+    set_bit_lsb(&mut target, bucket_index as usize, !current);
+
+    // Randomize lower-order bits to probe different points in this bucket range.
+    let mut state = entropy ^ 0x9E37_79B9_7F4A_7C15u64;
+    for bit in 0..bucket_index as usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        set_bit_lsb(&mut target, bit, (state & 1) != 0);
+    }
+
+    RoutingAction::Lookup(NodeId::from_bytes(target))
+}
+
+fn get_bit_lsb(bytes: &[u8; 32], bit_index: usize) -> bool {
+    let byte_from_end = bit_index / 8;
+    let bit_in_byte = bit_index % 8;
+    let byte_index = 31 - byte_from_end;
+    (bytes[byte_index] & (1u8 << bit_in_byte)) != 0
+}
+
+fn set_bit_lsb(bytes: &mut [u8; 32], bit_index: usize, value: bool) {
+    let byte_from_end = bit_index / 8;
+    let bit_in_byte = bit_index % 8;
+    let byte_index = 31 - byte_from_end;
+    let mask = 1u8 << bit_in_byte;
+
+    if value {
+        bytes[byte_index] |= mask;
+    } else {
+        bytes[byte_index] &= !mask;
     }
 }
 

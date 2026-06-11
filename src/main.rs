@@ -14,17 +14,20 @@ use velyx::{
     ControlAssembler, ControlChunk, HEADER_LEN, Negotiated, PROTOCOL_VERSION, PacketType,
     ReplayWindow, ServerHello, VWP_STREAM_ID_LEN, VwpFrame, VwpFrameType, WirePacket,
     chunk_control_message, negotiate, parse_server_and_validate,
-    dht::{NodeId, RoutingTable},
+    dht::{DhtMetricsSnapshot, NodeId, RoutingTable},
 };
 use velyx::stream::{
     ChaosConfig, ChaosScope, DirtyNetwork, StreamCommand, StreamControlEvent, StreamReceiver,
     StreamSender, StreamTelemetry, append_metrics_csv,
 };
-use velyx::dht_bridge::{execute_dht_action, send_control_command};
+use velyx::dht_bridge::{execute_dht_action, refresh_bucket_lookup_action, send_control_command};
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const DHT_DISCOVERY_INITIAL_DELAY: Duration = Duration::from_millis(800);
 const DHT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const DHT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(20);
+const DHT_REFRESH_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+const DHT_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SessionState {
@@ -320,6 +323,36 @@ fn benchmark_node_id(seed: u64) -> NodeId {
     NodeId::from_bytes(bytes)
 }
 
+fn log_dht_metrics(role: &str, snapshot: DhtMetricsSnapshot) {
+    let ping_success_rate = snapshot.ping_success_rate();
+    let avg_nodes_per_batch = snapshot.avg_nodes_per_batch();
+    let bucket_fill_ratio = snapshot.bucket_fill_ratio(20);
+    let m = snapshot.metrics;
+    println!(
+        "[DHT][metrics][{role}] nodes={} non_empty_buckets={} max_bucket_len={} bucket_fill_ratio={:.3} ping_success_rate={:.3} avg_nodes_per_batch={:.2} inserted={} existing={} pending={} ignored={} mark_ok={} mark_miss={} replace_ok={} replace_miss={} lookup_queries={} nodes_found_batches={} nodes_found_nodes={} refresh_marked={} actions_ping={} actions_lookup={}",
+        snapshot.total_nodes,
+        snapshot.non_empty_buckets,
+        snapshot.max_bucket_len,
+        bucket_fill_ratio,
+        ping_success_rate,
+        avg_nodes_per_batch,
+        m.insert_inserted,
+        m.insert_already_present,
+        m.insert_pending_ping,
+        m.insert_ignored_self,
+        m.mark_active_ok,
+        m.mark_active_miss,
+        m.replace_stale_ok,
+        m.replace_stale_miss,
+        m.lookup_queries,
+        m.nodes_found_batches,
+        m.nodes_found_nodes_total,
+        m.refresh_marked,
+        m.actions_generated_ping,
+        m.actions_generated_lookup,
+    );
+}
+
 async fn run_responder(
     bind_addr: &str,
     mut chaos: Option<DirtyNetwork>,
@@ -338,6 +371,8 @@ async fn run_responder(
     let mut dht = RoutingTable::new(local_node_id, 20);
     let mut dht_routes: HashMap<NodeId, SocketAddr> = HashMap::new();
     let mut pending_dht_actions = Vec::new();
+    let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
+    let mut next_metrics_log = std::time::Instant::now() + DHT_METRICS_LOG_INTERVAL;
     let mut in_buf = [0u8; 4096];
     let mut out_buf = [0u8; 4096];
     let mut completed_streams = 0u32;
@@ -680,7 +715,7 @@ async fn run_responder(
                                     hex::encode(target_id.as_bytes())
                                 );
 
-                                let closest = dht.lookup(target_id);
+                                let closest = dht.lookup_with_metrics(target_id);
                                 let message_id = session.next_dht_message_id;
                                 session.next_dht_message_id =
                                     session.next_dht_message_id.wrapping_add(1);
@@ -916,14 +951,27 @@ async fn run_responder(
                 let Some(executed) = execute_dht_action(action, local_node_id) else {
                     continue;
                 };
-                let target_id = executed.target_id;
                 let command = executed.command;
-                let Some(target_addr) = dht_routes.get(&target_id).copied() else {
-                    println!(
-                        "Skipping DHT action: no known route for target_id={}",
-                        hex::encode(target_id.as_bytes())
-                    );
-                    continue;
+                let target_addr = if let Some(route_to) = executed.route_to {
+                    let Some(addr) = dht_routes.get(&route_to).copied() else {
+                        println!(
+                            "Skipping DHT action: no known route for target_id={}",
+                            hex::encode(route_to.as_bytes())
+                        );
+                        continue;
+                    };
+                    addr
+                } else {
+                    let Some(addr) = peers.iter().find_map(|(addr, sess)| {
+                        (sess.state == SessionState::Active
+                            && sess.transport.is_some()
+                            && sess.last_stream_id != [0u8; VWP_STREAM_ID_LEN])
+                            .then_some(*addr)
+                    }) else {
+                        println!("Skipping DHT lookup action: no active routed peers available");
+                        continue;
+                    };
+                    addr
                 };
 
                 let Some(target_session) = peers.get_mut(&target_addr) else {
@@ -960,6 +1008,31 @@ async fn run_responder(
                     println!("Failed to execute DHT action toward {target_addr}: {err}");
                 }
             }
+        }
+
+        if now >= next_refresh_check {
+            if let Some(bucket_idx) =
+                dht.get_least_recently_refreshed_bucket_index(now, DHT_REFRESH_STALE_AFTER)
+            {
+                let entropy = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let action = refresh_bucket_lookup_action(&dht, bucket_idx, entropy);
+                dht.record_action_generated(action);
+                pending_dht_actions.push(action);
+                dht.mark_bucket_refreshed(bucket_idx);
+                println!(
+                    "[DHT] Refresh scheduled for bucket {} (responder)",
+                    bucket_idx
+                );
+            }
+            next_refresh_check = now + DHT_REFRESH_CHECK_INTERVAL;
+        }
+
+        if now >= next_metrics_log {
+            log_dht_metrics("responder", dht.metrics_snapshot());
+            next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
         }
 
         // Active discovery loop: periodically ask peers for nodes near our own ID.
@@ -1252,6 +1325,8 @@ async fn run_initiator(
     let mut dht_routes: HashMap<NodeId, ([u8; VWP_STREAM_ID_LEN], SocketAddr)> = HashMap::new();
     let mut next_dht_message_id = 100u32;
     let mut next_discovery_at = std::time::Instant::now() + DHT_DISCOVERY_INITIAL_DELAY;
+    let mut next_refresh_check = std::time::Instant::now() + DHT_REFRESH_CHECK_INTERVAL;
+    let mut next_metrics_log = std::time::Instant::now() + DHT_METRICS_LOG_INTERVAL;
     let mut sent_frames = 0usize;
     let mut logged_waiting_for_stop = false;
 
@@ -1314,6 +1389,58 @@ async fn run_initiator(
             .await
             .context("send periodic DHT FIND_NODE")?;
             next_discovery_at = now + DHT_DISCOVERY_INTERVAL;
+        }
+
+        if now >= next_refresh_check {
+            if let Some(bucket_idx) =
+                dht.get_least_recently_refreshed_bucket_index(now, DHT_REFRESH_STALE_AFTER)
+            {
+                let entropy = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let action = refresh_bucket_lookup_action(&dht, bucket_idx, entropy);
+                dht.record_action_generated(action);
+
+                if let Some(executed) = execute_dht_action(action, local_node_id) {
+                    let command = executed.command;
+                    let (target_stream_id, target_addr) = if let Some(route_to) = executed.route_to
+                    {
+                        if let Some(route) = dht_routes.get(&route_to).copied() {
+                            route
+                        } else {
+                            (stream_id, remote)
+                        }
+                    } else {
+                        (stream_id, remote)
+                    };
+
+                    let message_id = next_dht_message_id;
+                    next_dht_message_id = next_dht_message_id.wrapping_add(1);
+                    send_control_command(
+                        &socket,
+                        &mut transport,
+                        &mut out_buf,
+                        session_id,
+                        &mut tx_seq,
+                        &mut vwp_data_seq,
+                        target_stream_id,
+                        message_id,
+                        target_addr,
+                        command,
+                    )
+                    .await
+                    .context("send bucket refresh FIND_NODE")?;
+                    dht.mark_bucket_refreshed(bucket_idx);
+                    println!("[DHT] Refresh scheduled for bucket {} (initiator)", bucket_idx);
+                }
+            }
+            next_refresh_check = now + DHT_REFRESH_CHECK_INTERVAL;
+        }
+
+        if now >= next_metrics_log {
+            log_dht_metrics("initiator", dht.metrics_snapshot());
+            next_metrics_log = now + DHT_METRICS_LOG_INTERVAL;
         }
 
         let poll_timeout = if acked_chunks >= expected_acks { 12 } else { 3 };
@@ -1423,15 +1550,20 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
-                                let target_id = executed.target_id;
                                 let command = executed.command;
-                                let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
-                                    println!(
-                                        "Skipping DHT action: no known route for target_id={}",
-                                        hex::encode(target_id.as_bytes())
-                                    );
-                                    continue;
-                                };
+                                let (target_stream_id, target_addr) =
+                                    if let Some(route_to) = executed.route_to {
+                                        let Some(route) = dht_routes.get(&route_to).copied() else {
+                                            println!(
+                                                "Skipping DHT action: no known route for target_id={}",
+                                                hex::encode(route_to.as_bytes())
+                                            );
+                                            continue;
+                                        };
+                                        route
+                                    } else {
+                                        (control_stream_id, remote)
+                                    };
 
                                 let message_id = next_dht_message_id;
                                 next_dht_message_id = next_dht_message_id.wrapping_add(1);
@@ -1483,15 +1615,20 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
-                                let target_id = executed.target_id;
                                 let command = executed.command;
-                                let Some((target_stream_id, target_addr)) = dht_routes.get(&target_id).copied() else {
-                                    println!(
-                                        "Skipping DHT action: no known route for target_id={}",
-                                        hex::encode(target_id.as_bytes())
-                                    );
-                                    continue;
-                                };
+                                let (target_stream_id, target_addr) =
+                                    if let Some(route_to) = executed.route_to {
+                                        let Some(route) = dht_routes.get(&route_to).copied() else {
+                                            println!(
+                                                "Skipping DHT action: no known route for target_id={}",
+                                                hex::encode(route_to.as_bytes())
+                                            );
+                                            continue;
+                                        };
+                                        route
+                                    } else {
+                                        (control_stream_id, remote)
+                                    };
 
                                 let message_id = next_dht_message_id;
                                 next_dht_message_id = next_dht_message_id.wrapping_add(1);
@@ -1517,7 +1654,7 @@ async fn run_initiator(
                                 hex::encode(target_id.as_bytes())
                             );
 
-                            let closest = dht.lookup(target_id);
+                            let closest = dht.lookup_with_metrics(target_id);
                             let message_id = next_dht_message_id;
                             next_dht_message_id = next_dht_message_id.wrapping_add(1);
                             send_control_command(
@@ -1547,17 +1684,20 @@ async fn run_initiator(
                                 else {
                                     continue;
                                 };
-                                let target_id = executed.target_id;
                                 let command = executed.command;
-                                let Some((target_stream_id, target_addr)) =
-                                    dht_routes.get(&target_id).copied()
-                                else {
-                                    println!(
-                                        "Skipping DHT action: no known route for target_id={}",
-                                        hex::encode(target_id.as_bytes())
-                                    );
-                                    continue;
-                                };
+                                let (target_stream_id, target_addr) =
+                                    if let Some(route_to) = executed.route_to {
+                                        let Some(route) = dht_routes.get(&route_to).copied() else {
+                                            println!(
+                                                "Skipping DHT action: no known route for target_id={}",
+                                                hex::encode(route_to.as_bytes())
+                                            );
+                                            continue;
+                                        };
+                                        route
+                                    } else {
+                                        (control_stream_id, remote)
+                                    };
 
                                 let message_id = next_dht_message_id;
                                 next_dht_message_id = next_dht_message_id.wrapping_add(1);
