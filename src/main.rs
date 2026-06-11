@@ -635,11 +635,11 @@ async fn run_responder(
                         }
 
                         completed_streams = completed_streams.saturating_add(1);
-                        if let Some(limit) = stop_after_streams
-                            && completed_streams >= limit
-                        {
-                            println!("Responder reached stop-after-streams limit: {limit}");
-                            return Ok(());
+                        let limit_reached = stop_after_streams
+                            .map(|limit| completed_streams >= limit)
+                            .unwrap_or(false);
+                        if limit_reached {
+                            println!("Responder reached stop-after-streams limit, initiating teardown");
                         }
 
                         // Transition to Closing state and prepare STOP_STREAM for reliable retransmit.
@@ -700,7 +700,83 @@ async fn run_responder(
                 }
             }
             }  // close for vwp in frames_to_process
-            }  // close if let Some(session)
+            } else {
+                // New peer — must be Handshake1.
+                if packet.packet_type != PacketType::Handshake1 {
+                    println!("Dropping non-handshake packet from unknown peer {remote}");
+                } else {
+                    let params: NoiseParams = match NOISE_PATTERN.parse() {
+                        Ok(p) => p,
+                        Err(err) => { println!("Failed to parse noise pattern: {err}"); continue; }
+                    };
+                    let mut hs = match Builder::new(params)
+                        .local_private_key(&static_key)
+                        .build_responder()
+                    {
+                        Ok(h) => h,
+                        Err(err) => { println!("Failed to build responder handshake: {err}"); continue; }
+                    };
+
+                    let hello1_len = match hs.read_message(&packet.payload, &mut out_buf) {
+                        Ok(n) => n,
+                        Err(err) => { println!("Failed to read Handshake1 from {remote}: {err}"); continue; }
+                    };
+                    let client_hello = match ClientHello::decode(&out_buf[..hello1_len]) {
+                        Ok(h) => h,
+                        Err(err) => { println!("Invalid ClientHello from {remote}: {err}"); continue; }
+                    };
+                    let negotiated = match negotiate(local, client_hello) {
+                        Ok(n) => n,
+                        Err(err) => { println!("Negotiation failed for {remote}: {err}"); continue; }
+                    };
+                    let server_hello = ServerHello {
+                        min_version: local.min_version,
+                        max_version: local.max_version,
+                        caps: local.mask,
+                        selected_version: negotiated.version,
+                        selected_caps: negotiated.caps,
+                    };
+                    let hello2_len = match hs.write_message(&server_hello.encode(), &mut out_buf) {
+                        Ok(n) => n,
+                        Err(err) => { println!("Failed to write Handshake2 for {remote}: {err}"); continue; }
+                    };
+                    let session_id = packet.session_id;
+                    let pkt2 = WirePacket {
+                        version: PROTOCOL_VERSION,
+                        packet_type: PacketType::Handshake2,
+                        flags: 0,
+                        session_id,
+                        seq: 0,
+                        payload: out_buf[..hello2_len].to_vec(),
+                    };
+                    let raw2 = match pkt2.encode() {
+                        Ok(r) => r,
+                        Err(err) => { println!("Failed to encode Handshake2 for {remote}: {err}"); continue; }
+                    };
+                    if let Err(err) = socket.send_to(&raw2, remote).await {
+                        println!("Failed to send Handshake2 to {remote}: {err}");
+                        continue;
+                    }
+
+                    let session = PeerSession {
+                        session_id,
+                        negotiated,
+                        handshake: Some(hs),
+                        transport: None,
+                        tx_seq: 1,
+                        recv_replay: ReplayWindow::default(),
+                        vwp_tx_seq: 0,
+                        stream_receiver: StreamReceiver::default(),
+                        control_assembler: ControlAssembler::default(),
+                        reorder_hold: None,
+                        telemetry: StreamTelemetry::default(),
+                        state: SessionState::Active,
+                        retransmit: None,
+                    };
+                    peers.insert(remote, session);
+                    println!("New peer {remote}: handshake in progress (session_id={session_id})");
+                }
+            }  // close if let Some(session) else
         }
         Ok(Err(err)) => {
             println!("UDP recv_from error: {err}");
@@ -781,8 +857,17 @@ async fn run_responder(
         }
 
         for addr in to_remove {
-            println!("[{addr}] Removing Closing session");
+            println!("[{addr}] Removing session (teardown complete)");
             peers.remove(&addr);
+        }
+
+        // Exit cleanly once all sessions have completed teardown.
+        if stop_after_streams.is_some()
+            && completed_streams >= stop_after_streams.unwrap_or(0)
+            && peers.values().all(|s| s.state != SessionState::Closing)
+        {
+            println!("All streams delivered and teardown complete, responder exiting");
+            return Ok(());
         }
     }
 }
@@ -842,10 +927,24 @@ async fn run_initiator(
         .await
         .context("failed to send handshake message 1")?;
 
-    let (len2, from2) = socket
-        .recv_from(&mut in_buf)
-        .await
-        .context("failed to receive handshake message 2")?;
+    // Retry Handshake1 with 200ms timeout until Handshake2 arrives (max 10 attempts).
+    let (len2, from2) = {
+        let mut attempt = 0usize;
+        loop {
+            match timeout(Duration::from_millis(200), socket.recv_from(&mut in_buf)).await {
+                Ok(Ok((len, from))) => break (len, from),
+                Ok(Err(err)) => return Err(err).context("recv_from error waiting for handshake 2"),
+                Err(_) => {
+                    attempt += 1;
+                    if attempt >= 10 {
+                        bail!("timed out waiting for handshake 2 after 10 retries");
+                    }
+                    // Re-send Handshake1 in case the packet was dropped.
+                    socket.send_to(&raw1, remote).await.context("failed to retransmit handshake 1")?;
+                }
+            }
+        }
+    };
     if from2 != remote {
         bail!("handshake source mismatch: expected {remote}, got {from2}");
     }

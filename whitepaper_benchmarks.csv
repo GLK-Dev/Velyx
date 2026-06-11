@@ -1,2 +1,7 @@
 run_id,loss_pct,jitter_ms,reorder_pct,initiator_ok,responder_ok,end_to_end_ms,recovery_time_ms,goodput_bytes_per_sec,overhead_ratio,data_frames_dropped,data_frames_duplicated,data_frames_reordered
-1,0,0,0,false,true,164584,6803,38533.59,1.0000,0,0,0
+1,0,0,0,false,true,25019,3316,79054.28,1.0000,0,0,0
+2,0,0,10,false,true,25436,3517,74536.25,1.0148,0,0,3
+3,0,0,25,false,true,25433,3564,73553.31,1.0443,0,0,9
+4,0,10,0,false,true,24943,3373,77718.35,1.0000,0,0,0
+5,0,10,10,false,true,24933,3397,77169.27,1.0049,0,0,1
+6,0,10,25,false,true,25433,3431,76404.55,1.0690,0,0,14
