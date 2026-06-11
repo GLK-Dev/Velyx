@@ -60,6 +60,9 @@ struct ResponderOptions {
 
 struct InitiatorOptions {
     payload_size_bytes: usize,
+    /// Disables 1ms inter-frame sleep for loopback benchmarks where the
+    /// OS scheduler granularity would otherwise dominate run time.
+    no_pacing: bool,
 }
 
 struct BenchmarkOptions {
@@ -116,6 +119,7 @@ async fn main() -> Result<()> {
                 args[3].as_str(),
                 InitiatorOptions {
                     payload_size_bytes: 80 * 135,
+                    no_pacing: false,
                 },
             )
             .await
@@ -959,8 +963,10 @@ async fn run_initiator(
             .await
             .context("failed to send raptor data frame")?;
 
-        // MVP pacing to avoid local UDP queue overflow.
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        // Pacing to avoid local UDP queue overflow (disabled in benchmark/loopback mode).
+        if !options.no_pacing {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
         let poll_timeout = if acked_chunks >= expected_acks { 12 } else { 3 };
         let recv_result = timeout(
@@ -1127,6 +1133,7 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                     &remote_addr,
                     InitiatorOptions {
                         payload_size_bytes: options.payload_size_bytes,
+                        no_pacing: true,
                     },
                 )
                 .await;
@@ -1177,6 +1184,125 @@ async fn run_benchmark_matrix(options: &BenchmarkOptions) -> Result<()> {
                 );
             }
         }
+    }
+
+    // AllFrames stress profiles — named real-world network scenarios.
+    // These validate STOP_STREAM retransmit reliability under total chaos.
+    struct NetworkProfile {
+        name: &'static str,
+        loss: u8,
+        jitter: u16,
+        reorder: u8,
+    }
+    let allframes_profiles = [
+        NetworkProfile { name: "mobile_3g_edge",    loss: 10, jitter: 50, reorder:  0 },
+        NetworkProfile { name: "congested_wifi",    loss: 20, jitter: 10, reorder: 10 },
+        NetworkProfile { name: "starlink_storm",    loss: 30, jitter: 20, reorder: 25 },
+        NetworkProfile { name: "datacenter_flap",  loss:  5, jitter:  5, reorder:  5 },
+    ];
+
+    for profile in &allframes_profiles {
+        run_id += 1;
+        if let Some(max) = options.max_runs
+            && run_id > max
+        {
+            println!("Benchmark matrix stopped after max-runs={max}");
+            println!("Partial benchmark output: {}", options.output_csv);
+            return Ok(());
+        }
+
+        let port = 12000 + run_id as u16;
+        let bind_addr = format!("127.0.0.1:{port}");
+        let remote_addr = bind_addr.clone();
+        let per_run_metrics = format!("bench_run_{run_id}.csv");
+        if Path::new(&per_run_metrics).exists() {
+            std::fs::remove_file(&per_run_metrics)
+                .with_context(|| format!("failed to remove old file {per_run_metrics}"))?;
+        }
+
+        let chaos_cfg = ChaosConfig {
+            drop_data_pct: profile.loss,
+            drop_control_pct: profile.loss,  // AllFrames: control/ack also affected
+            drop_ack_pct: profile.loss,
+            duplicate_pct: 0,
+            reorder_pct: profile.reorder,
+            jitter_ms: profile.jitter,
+            scope: ChaosScope::AllFrames,
+        }
+        .validate()?;
+
+        println!(
+            "AllFrames profile '{}': loss={}% jitter={}ms reorder={}%",
+            profile.name, profile.loss, profile.jitter, profile.reorder
+        );
+
+        let responder = tokio::spawn({
+            let bind_addr = bind_addr.clone();
+            let metrics_path = per_run_metrics.clone();
+            async move {
+                let dirty = Some(DirtyNetwork::new(chaos_cfg, 0xDEAD0000 + run_id as u64)?);
+                run_responder(&bind_addr, dirty, Some(metrics_path), Some(1)).await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let bench_started = std::time::Instant::now();
+        let initiator_result = run_initiator(
+            "127.0.0.1:0",
+            &remote_addr,
+            InitiatorOptions {
+                payload_size_bytes: options.payload_size_bytes,
+                no_pacing: true,
+            },
+        )
+        .await;
+
+        let initiator_ok = match initiator_result {
+            Ok(stop_ok) => stop_ok,
+            Err(err) => {
+                println!("Benchmark run {run_id} ({}): initiator error: {err}", profile.name);
+                false
+            }
+        };
+
+        let responder_ok = match timeout(Duration::from_secs(15), responder).await {
+            Ok(joined) => match joined {
+                Ok(result) => result.is_ok(),
+                Err(err) => {
+                    println!("Benchmark run {run_id} ({}): responder join error: {err}", profile.name);
+                    false
+                }
+            },
+            Err(_) => {
+                println!("Benchmark run {run_id} ({}): responder timeout", profile.name);
+                false
+            }
+        };
+
+        let elapsed_ms = bench_started.elapsed().as_millis();
+        let metrics = parse_last_metrics_row(&per_run_metrics)?;
+
+        append_benchmark_row(
+            &options.output_csv,
+            run_id,
+            profile.loss,
+            profile.jitter,
+            profile.reorder,
+            initiator_ok,
+            responder_ok,
+            elapsed_ms,
+            metrics,
+        )?;
+
+        if Path::new(&per_run_metrics).exists() {
+            let _ = std::fs::remove_file(&per_run_metrics);
+        }
+
+        println!(
+            "Benchmark run #{run_id} ({}) completed: initiator_ok={initiator_ok} responder_ok={responder_ok}",
+            profile.name
+        );
     }
 
     println!("Benchmark matrix complete. Output: {}", options.output_csv);
